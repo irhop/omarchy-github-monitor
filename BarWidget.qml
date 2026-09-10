@@ -226,6 +226,12 @@ BarWidget {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // Open straight to the settings view, for a keybind.
+    function settings(): void {
+      if (!panelLoader.item) return
+      panelLoader.item.configuring = true
+      root.open()
+    }
     // Open straight to the add view, for a keybind.
     function add(): void {
       if (!panelLoader.item) return

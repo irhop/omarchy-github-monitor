@@ -28,6 +28,7 @@ Panel {
   // The add/search view. One text field serves both: a value that looks like
   // a repository is added directly, anything else is searched for.
   property bool adding: false
+  property bool configuring: false
   onAddingChanged: if (adding) Qt.callLater(function () { queryField.forceActiveFocus() })
   property string query: ""
   property var results: []
@@ -109,6 +110,29 @@ Panel {
         : "Could not install the timer. Run `omarchy-github-monitor bootstrap` to see why."
       if (root.hostWidget) root.hostWidget.refresh()
     }
+  }
+
+  // Settings are stored inline in the widget's shell.json layout entry, which
+  // is the same place `omarchy bar set` writes and the same place the daemon
+  // reads. Writing anywhere else would look like it worked and change nothing.
+  function writeSetting(key, value) {
+    var entry = { id: root.moduleName }
+    var current = root.settings || {}
+    for (var name in current) if (name !== "id") entry[name] = current[name]
+    entry[key] = value
+
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+
+    // The daemon reads shell.json on its next run; poll now so the change is
+    // visible immediately rather than up to fifteen minutes later.
+    if (root.hostWidget) root.hostWidget.poll()
+  }
+
+  function settingValue(key, fallback) {
+    var value = root.settings ? root.settings[key] : undefined
+    return value === undefined || value === null ? fallback : value
   }
 
   function closeAdd() {
@@ -318,6 +342,7 @@ Panel {
     if (!opened) {
       selectedRepo = ""
       closeAdd()
+      configuring = false
       // Closing is the moment you have finished looking, so the dots clear
       // then rather than the instant the list appears.
       markSeen()
@@ -347,12 +372,13 @@ Panel {
       PanelSectionHeader {
         Layout.fillWidth: true
         foreground: root.foreground
-        text: root.adding ? "Add a repository"
-                          : (root.selected ? root.selected.repo : "Tracked repositories")
+        text: root.configuring ? "Settings"
+              : root.adding ? "Add a repository"
+              : (root.selected ? root.selected.repo : "Tracked repositories")
       }
 
       PanelActionButton {
-        visible: !root.adding && root.selected === null
+        visible: !root.adding && !root.configuring && root.selected === null
         iconText: "\uf067"
         tooltipText: "Add a repository"
         foreground: root.foreground
@@ -361,13 +387,21 @@ Panel {
           Qt.callLater(function () { queryField.forceActiveFocus() })
         }
       }
+
+      PanelActionButton {
+        visible: !root.adding && root.selected === null
+        iconText: "\uf013"
+        tooltipText: root.configuring ? "Back to the list" : "Settings"
+        foreground: root.configuring ? Color.accent : root.foreground
+        onClicked: root.configuring = !root.configuring
+      }
     }
 
     // ---- add and search
     ColumnLayout {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      visible: root.adding
+      visible: root.adding && !root.configuring
       spacing: Style.space(8)
 
       TextField {
@@ -556,11 +590,116 @@ Panel {
       }
     }
 
+    // ---- settings
+    Flickable {
+      Layout.fillWidth: true
+      Layout.fillHeight: true
+      visible: root.configuring && root.selected === null && !root.adding
+      clip: true
+      contentHeight: settingsColumn.implicitHeight
+      contentWidth: width
+      interactive: contentHeight > height
+
+    ColumnLayout {
+      id: settingsColumn
+      width: parent.width
+      spacing: Style.space(6)
+
+      Toggle {
+        Layout.fillWidth: true
+        label: "Count prereleases"
+        description: "Treat -rc, -beta and -alpha tags as releases, everywhere. Individual repositories can override this."
+        foreground: root.foreground
+        checked: root.settingValue("includePrereleases", false) === true
+        onClicked: root.writeSetting("includePrereleases", !checked)
+      }
+
+      Toggle {
+        Layout.fillWidth: true
+        label: "Warn when a project goes quiet"
+        description: "The ⚠ count in the bar"
+        foreground: root.foreground
+        checked: root.settingValue("showOverdue", true) !== false
+        onClicked: root.writeSetting("showOverdue", !checked)
+      }
+
+      Toggle {
+        Layout.fillWidth: true
+        label: "Show the number"
+        description: "Off leaves an icon that only lights up when something ships"
+        foreground: root.foreground
+        checked: root.settingValue("showCount", true) !== false
+        onClicked: root.writeSetting("showCount", !checked)
+      }
+
+      Toggle {
+        Layout.fillWidth: true
+        label: "Notify on a new release"
+        foreground: root.foreground
+        checked: root.settingValue("notify", true) !== false
+        onClicked: root.writeSetting("notify", !checked)
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        Layout.topMargin: Style.space(6)
+        spacing: Style.space(2)
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          text: "Overdue after " + root.settingValue("overdueFactor", 1.5).toFixed(1)
+            + "× a project's usual gap"
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          color: root.foreground
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "A project that usually ships every 10 days is overdue after "
+            + Math.round(root.settingValue("overdueFactor", 1.5) * 10) + " days."
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          color: root.dim
+        }
+
+        PanelSlider {
+          Layout.fillWidth: true
+          Layout.topMargin: Style.space(4)
+          bar: root.bar
+          minimum: 1.0
+          maximum: 5.0
+          step: 0.1
+          value: root.settingValue("overdueFactor", 1.5)
+          // On release, not on every pixel of the drag: each write touches
+          // shell.json and triggers a poll.
+          onReleased: function (value) {
+            root.writeSetting("overdueFactor", Math.round(value * 10) / 10)
+          }
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        Layout.topMargin: Style.space(8)
+        wrapMode: Text.Wrap
+        text: "Prereleases and overdue warnings can also be set per repository, in its notes view."
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        color: root.dim
+      }
+    }
+    }
+
     // ---- first run
     ColumnLayout {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      visible: root.empty && !root.adding && root.selected === null
+      visible: root.empty && !root.adding && !root.configuring && root.selected === null
       spacing: Style.space(10)
 
       Item { Layout.fillHeight: true }
@@ -618,7 +757,7 @@ Panel {
     ListView {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      visible: root.selected === null && !root.adding && !root.empty
+      visible: root.selected === null && !root.adding && !root.configuring && !root.empty
       clip: true
       spacing: Style.space(2)
       model: root.sorted
@@ -714,6 +853,7 @@ Panel {
           if (root.notice !== "" && !root.adding) return root.notice
           if (!root.everRun) return ""
           if (root.stale) return "poll has stopped — check omarchy-github-monitor.timer"
+          if (root.configuring) return ""
           if (root.selected === null && !root.adding) return "click a row for notes · middle click opens GitHub"
           return ""
         }
@@ -726,7 +866,11 @@ Panel {
         iconText: ""
         tooltipText: "Back to the list"
         foreground: root.foreground
-        onClicked: { if (root.adding) root.closeAdd(); else root.selectedRepo = "" }
+        onClicked: {
+          if (root.configuring) root.configuring = false
+          else if (root.adding) root.closeAdd()
+          else root.selectedRepo = ""
+        }
       }
 
       PanelActionButton {

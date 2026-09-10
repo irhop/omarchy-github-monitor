@@ -11,6 +11,23 @@ when one ships — or when one has gone quiet for longer than it usually does.
 
 Click for the list and the release notes. Middle click polls now.
 
+## Settings
+
+The cog in the panel header. Four toggles — count prereleases, warn when a
+project goes quiet, show the number, notify on a new release — and a slider
+for how far past its own rhythm a project goes before it is called overdue.
+
+Changes are written to the widget's entry in `shell.json`, the same place
+`omarchy bar set` writes and the daemon reads, and take effect on the poll
+that fires immediately after:
+
+```bash
+omarchy bar set io.github.irhop.github-monitor overdueFactor 2.0
+```
+
+Per-repository choices — prereleases, and silencing the overdue warning for
+one project — live in that repository's notes view, not here.
+
 ## What clicks do
 
 In the bar:
@@ -219,7 +236,7 @@ o.bind("SUPER + ALT + R", "GitHub releases", "omarchy-shell github-monitor toggl
 o.bind("SUPER + ALT + SHIFT + R", "Track a GitHub repository", "omarchy-shell github-monitor add")
 ```
 
-Other IPC routes: `poll`, `open`, `close`, `show <owner/repo>`.
+Other IPC routes: `poll`, `open`, `close`, `settings`, `show <owner/repo>`.
 
 ## How it fits together
 
