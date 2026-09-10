@@ -48,6 +48,43 @@ If a token is present in the environment (`GITHUB_TOKEN`, `GH_TOKEN`) or
 obtainable from `gh auth token`, the daemon adds both. It is never required,
 and the plugin never stores one.
 
+## Rate limits and authentication
+
+The plugin discloses limits; it never prompts for credentials. A bar widget
+that asks for a token is a bar widget that gets uninstalled. Hiding the limits
+is worse — the user hits a wall with no explanation.
+
+**Where limits are cited.** Search responses carry `x-ratelimit-limit`,
+`x-ratelimit-remaining` and `x-ratelimit-reset`. When remaining runs low the
+search output ends with `4 of 10 searches left this minute`. A `403` reports
+the seconds until reset, not a traceback.
+
+**`status` subcommand.** The full picture, on demand:
+
+```
+19 repos, polled every 15m via releases.atom   0 API requests
+search                                          10/min, 9 left
+authentication                                  none
+
+Authenticating adds: commits since latest tag, exact prerelease flags
+Any of these is picked up automatically:
+  gh auth login          (recommended, browser flow, nothing to copy)
+  GITHUB_TOKEN=...       in the environment
+  GH_TOKEN=...
+```
+
+**In the panel.** One dim footer line, `unauthenticated — commits since tag
+unavailable`. A statement, not a call to action: no button, no dialog, no
+badge. It is absent entirely when a token is found.
+
+**Token handling.** Read at fetch time from `GITHUB_TOKEN`, then `GH_TOKEN`,
+then `gh auth token`, first hit wins. Never written to disk, never copied into
+the state file, never logged. Revocation happens where the token was granted.
+
+This is only tenable because polling costs nothing against the API budget.
+Authentication buys two enrichment fields, so the message can stay a statement
+of fact rather than a request.
+
 ## Architecture
 
 Follows the shape of `io.github.irhop.mouse-odometer`: a Python process writes
@@ -90,6 +127,7 @@ Subcommands:
 - `bootstrap` — install and enable the user timer. Never runs implicitly;
   enabling the plugin alone installs nothing, matching mouse-odometer.
 - `list` / `add` / `remove` / `search` — manage the tracked repositories.
+- `status` — repo count, poll cost, search budget, authentication state.
 
 Fetching reuses the existing `ThreadPoolExecutor` pattern. Stored ETags make
 repeat polls cheap.
