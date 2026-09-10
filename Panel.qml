@@ -80,6 +80,37 @@ Panel {
     addProcess.running = true
   }
 
+  function runBootstrap() {
+    if (busy) return
+    busy = true
+    notice = ""
+    bootstrapProcess.running = true
+  }
+
+  Process {
+    id: bootstrapProcess
+    clearEnvironment: true
+    // XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are how `systemctl --user`
+    // reaches the session manager. Without them the timer install fails.
+    environment: {
+      var env = root.monitorEnvironment()
+      var keep = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+      for (var i = 0; i < keep.length; i++) {
+        var value = Quickshell.env(keep[i])
+        if (value) env[keep[i]] = value
+      }
+      return env
+    }
+    command: [root.monitorBin, "bootstrap"]
+    onExited: function (exitCode) {
+      root.busy = false
+      root.notice = exitCode === 0
+        ? "Polling every 15 minutes."
+        : "Could not install the timer. Run `omarchy-github-monitor bootstrap` to see why."
+      if (root.hostWidget) root.hostWidget.refresh()
+    }
+  }
+
   function closeAdd() {
     adding = false
     query = ""
@@ -139,6 +170,11 @@ Panel {
   }
 
   readonly property var repos: hostWidget ? hostWidget.repos : []
+  // No state file at all means the daemon has never run here, which is a
+  // different situation from a poll that has stopped, and needs different
+  // words: nothing is broken, nothing has been set up.
+  readonly property bool everRun: hostWidget ? hostWidget.everRun : false
+  readonly property bool empty: repos.length === 0
   readonly property bool stale: hostWidget ? hostWidget.stale : false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -169,6 +205,27 @@ Panel {
   function markSeen() {
     seenProcess.command = [monitorBin, "seen"]
     seenProcess.running = true
+  }
+
+  function togglePrereleases(entry) {
+    if (!entry || busy) return
+    busy = true
+    // Only two states from the panel: following prereleases or not. The
+    // third, "whatever the global setting says", stays a CLI concern.
+    preProcess.command = entry.prereleases_included
+      ? [monitorBin, "pre", "--off", entry.repo]
+      : [monitorBin, "pre", entry.repo]
+    preProcess.running = true
+  }
+
+  Process {
+    id: preProcess
+    clearEnvironment: true
+    environment: root.monitorEnvironment()
+    onExited: {
+      root.busy = false
+      if (root.hostWidget) root.hostWidget.refresh()
+    }
   }
 
   function toggleMute(entry) {
@@ -457,6 +514,15 @@ Panel {
               }
 
               PanelActionButton {
+                iconText: "\uf0c3"
+                tooltipText: root.selected.prereleases_included
+                  ? "Stable releases only"
+                  : "Follow prereleases too"
+                foreground: root.selected.prereleases_included ? Color.accent : root.dim
+                onClicked: root.togglePrereleases(root.selected)
+              }
+
+              PanelActionButton {
                 iconText: root.selected.overdue_muted ? "\uf1f6" : "\uf0f3"
                 tooltipText: root.selected.overdue_muted
                   ? "Warn again when this one goes quiet"
@@ -490,11 +556,69 @@ Panel {
       }
     }
 
+    // ---- first run
+    ColumnLayout {
+      Layout.fillWidth: true
+      Layout.fillHeight: true
+      visible: root.empty && !root.adding && root.selected === null
+      spacing: Style.space(10)
+
+      Item { Layout.fillHeight: true }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.Wrap
+        text: root.everRun
+          ? "Nothing tracked yet."
+          : "Nothing tracked yet, and no poll has run."
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        color: root.foreground
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.Wrap
+        text: "Add a repository with +, or search for one by name.\nNo GitHub account needed."
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        color: root.dim
+      }
+
+      Button {
+        Layout.alignment: Qt.AlignHCenter
+        visible: !root.everRun
+        text: root.busy ? "Setting up…" : "Check every 15 minutes"
+        enabled: !root.busy
+        // Installing a user timer is a decision, so it happens on a click and
+        // never as a side effect of enabling the plugin.
+        onClicked: root.runBootstrap()
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.Wrap
+        visible: !root.everRun
+        text: "Installs a systemd user timer. Nothing was installed when you enabled this."
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        color: root.dim
+      }
+
+      Item { Layout.fillHeight: true }
+    }
+
     // ---- the list
     ListView {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      visible: root.selected === null && !root.adding
+      visible: root.selected === null && !root.adding && !root.empty
       clip: true
       spacing: Style.space(2)
       model: root.sorted
@@ -540,7 +664,9 @@ Panel {
               textFormat: Text.PlainText
               Layout.fillWidth: true
               elide: Text.ElideRight
-              text: (modelData.tag || "—") + "  ·  " + root.cadenceText(modelData)
+              text: (modelData.tag || "—")
+                + (modelData.prerelease ? "  (prerelease)" : "")
+                + "  ·  " + root.cadenceText(modelData)
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               color: root.dim
@@ -585,6 +711,8 @@ Panel {
         // when one is absent. The line is for real trouble only.
         text: {
           if (root.toast !== "") return root.toast
+          if (root.notice !== "" && !root.adding) return root.notice
+          if (!root.everRun) return ""
           if (root.stale) return "poll has stopped — check omarchy-github-monitor.timer"
           if (root.selected === null && !root.adding) return "click a row for notes · middle click opens GitHub"
           return ""

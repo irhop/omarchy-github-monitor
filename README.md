@@ -57,6 +57,30 @@ dot clears when you close the panel rather than when a timer runs out. Nothing
 is unseen on the first poll — otherwise installing this would greet you with
 nineteen notifications.
 
+## Stable or prereleases
+
+Stable only, by default: `-rc`, `-beta`, `-alpha` and `v35.0.0rc4` are read as
+prereleases and skipped. Turn them on everywhere with **Count prereleases** in
+the widget's settings, or decide per repository — which is usually what you
+want, since following one project's release candidates rarely means following
+everyone's:
+
+```bash
+omarchy-github-monitor pre nextcloud/server            # follow prereleases here
+omarchy-github-monitor pre nextcloud/server --off      # stable only here
+omarchy-github-monitor pre nextcloud/server --default  # follow the global setting
+```
+
+The flask button in the notes view does the same thing. A per-repository
+choice wins over the global setting in both directions, and is stored on the
+line in `repos.txt` as `+pre` or `-pre`.
+
+Changing it re-fetches that repository rather than re-filtering what was
+cached: which release counts as the latest depends on the answer, and the feed
+body is not kept.
+
+A row showing a prerelease says so, in the list and in the notes.
+
 ## Overdue
 
 The feature no feed reader gives you. Each repository's own average gap

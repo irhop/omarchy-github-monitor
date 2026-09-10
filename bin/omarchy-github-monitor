@@ -80,7 +80,7 @@ MIN_CADENCE_DAYS = 1.0
 # Bumped whenever parsing or computation changes. Cached entries are reused on
 # an HTTP 304, so without this a logic fix would never reach rows whose feeds
 # had not changed — they would keep serving results the old code produced.
-LOGIC_VERSION = 5
+LOGIC_VERSION = 6
 
 
 # ---------------------------------------------------------------- basics
@@ -193,6 +193,34 @@ def load_repos():
 
 def muted_repos():
     return {repo for repo, flags in load_repo_entries() if "!overdue" in flags}
+
+
+def prereleases_for(flags, opts):
+    """Whether this repository counts prereleases.
+
+    A per-repository flag wins over the global setting in both directions, so
+    you can follow one project's release candidates without turning them on
+    everywhere, or stay on stable for a project that ships rc builds daily.
+    """
+    if "+pre" in flags:
+        return True
+    if "-pre" in flags:
+        return False
+    return opts["include_prereleases"]
+
+
+def set_prereleases(repo, mode):
+    """mode: 'on', 'off' or 'default'."""
+    changed = []
+    for name, flags in load_repo_entries():
+        if name == repo:
+            flags = set(flags) - {"+pre", "-pre"}
+            if mode == "on":
+                flags.add("+pre")
+            elif mode == "off":
+                flags.add("-pre")
+        changed.append((name, flags))
+    save_repo_entries(changed)
 
 
 def set_overdue_muted(repo, muted):
@@ -452,9 +480,11 @@ def apply_derived(entry, opts, muted, now):
     return entry
 
 
-def summarize(repo, releases, previous, opts, now, muted=False):
+def summarize(repo, releases, previous, opts, now, muted=False, include_pre=None):
     """Turn a parsed feed into the state-file entry for one repository."""
-    if not opts["include_prereleases"]:
+    if include_pre is None:
+        include_pre = opts["include_prereleases"]
+    if not include_pre:
         stable = [r for r in releases if not r["prerelease"]]
         if stable:
             releases = stable
@@ -488,11 +518,14 @@ def summarize(repo, releases, previous, opts, now, muted=False):
         and is_overdue(days_since, avg_days, len(releases), opts["overdue_factor"]),
         "overdue_muted": muted,
         "commits_since_tag": (previous or {}).get("commits_since_tag"),
+        # Recorded so a changed preference can be detected: the feed body is
+        # not stored, so switching this has to re-fetch rather than re-filter.
+        "prereleases_included": include_pre,
         "error": None,
     }
 
 
-def fetch_repo(repo, previous, opts, now, muted=False):
+def fetch_repo(repo, previous, opts, now, muted=False, include_pre=None):
     """One repository. A failure keeps the last good entry so a dead feed
     cannot blank a row that was fine an hour ago."""
     headers = {}
@@ -517,7 +550,7 @@ def fetch_repo(repo, previous, opts, now, muted=False):
     except ET.ParseError as exc:
         return {**(previous or {"repo": repo}), "error": f"malformed feed: {exc}"}
 
-    entry = summarize(repo, releases, previous, opts, now, muted)
+    entry = summarize(repo, releases, previous, opts, now, muted, include_pre)
     was = (previous or {}).get("tag")
     # A tag that differs from the one recorded is unseen until you open the
     # panel. On a first run there is nothing recorded, so nothing is unseen —
@@ -550,6 +583,7 @@ def cmd_fetch(args):
 
     state = load_state()
     opts = settings(state)
+    entries = load_repo_entries()
     muted = muted_repos()
     now = now_utc()
     if state.get("logic_version") == LOGIC_VERSION:
@@ -562,11 +596,19 @@ def cmd_fetch(args):
             for entry in state.get("repos", [])
         }
 
+    flags_for = dict(entries)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {
-            pool.submit(fetch_repo, repo, previous.get(repo), opts, now, repo in muted): repo
-            for repo in repos
-        }
+        futures = {}
+        for repo in repos:
+            include_pre = prereleases_for(flags_for.get(repo, set()), opts)
+            stored = previous.get(repo)
+            # A changed preference cannot be applied to a cached entry: which
+            # release is "latest" depends on it, and the feed body is gone.
+            if stored and stored.get("prereleases_included") != include_pre:
+                stored = {k: v for k, v in stored.items() if k != "_etag"}
+            futures[pool.submit(
+                fetch_repo, repo, stored, opts, now, repo in muted, include_pre
+            )] = repo
         entries = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
 
     # Ages and overdue state depend on now and on the current settings, so
@@ -633,6 +675,8 @@ def cmd_list(args):
         mark = " ⚠ overdue" if entry.get("overdue") else (
             " (overdue muted)" if entry.get("overdue_muted") else ""
         )
+        if entry.get("prerelease"):
+            mark = "  (prerelease)" + mark
         mark = ("  ●" if entry.get("unseen") else "  ") + mark
         error = f"  ({entry['error']})" if entry.get("error") else ""
         print(f"  {repo:42} {tag:20} {age:>10}{mark}{error}")
@@ -1101,6 +1145,19 @@ def cmd_seen(args):
     return 0
 
 
+def cmd_pre(args):
+    repo = normalize_repo(args.repo) or args.repo
+    if repo not in load_repos():
+        print(f"{repo} is not tracked.", file=sys.stderr)
+        return 1
+    mode = "default" if args.default else ("off" if args.off else "on")
+    set_prereleases(repo, mode)
+    described = {"on": "including prereleases", "off": "stable releases only",
+                 "default": "following the global setting"}[mode]
+    print(f"{repo}: {described}")
+    return cmd_fetch(argparse.Namespace(quiet=True))
+
+
 def cmd_mute(args):
     repo = normalize_repo(args.repo) or args.repo
     if repo not in load_repos():
@@ -1233,6 +1290,12 @@ def main():
     installed.add_argument("--remote-only", action="store_true", help="skip pacman and mise")
     installed.add_argument("--json", action="store_true")
     installed.set_defaults(func=cmd_installed)
+
+    pre = sub.add_parser("pre", help="follow prereleases for one repository")
+    pre.add_argument("repo")
+    pre.add_argument("--off", action="store_true", help="stable releases only")
+    pre.add_argument("--default", action="store_true", help="follow the global setting")
+    pre.set_defaults(func=cmd_pre)
 
     status = sub.add_parser("status", help="poll cost, search budget, authentication")
     status.set_defaults(func=cmd_status)

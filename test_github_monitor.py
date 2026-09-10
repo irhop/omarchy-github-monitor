@@ -417,3 +417,52 @@ assert ghmon.compare_versions("v18.21.0", "18.21.0") == "current"
 assert ghmon.compare_versions("v18.22.0", "18.21.0") == "behind"
 
 print("local install matching covered")
+
+
+# ---- prereleases, globally and per repository
+
+mixed_feed = ghmon.parse_feed(
+    feed([("v35.0.0rc4", days_ago(1, NOW), ""), ("v32.0.15", days_ago(9, NOW), "")])
+)
+
+stable_only = {"include_prereleases": False, "overdue_factor": 1.5}
+everything = {"include_prereleases": True, "overdue_factor": 1.5}
+
+assert ghmon.summarize("o/r", mixed_feed, None, stable_only, NOW)["tag"] == "v32.0.15"
+assert ghmon.summarize("o/r", mixed_feed, None, everything, NOW)["tag"] == "v35.0.0rc4"
+
+# A per-repository flag overrides the global setting in both directions.
+assert ghmon.prereleases_for(set(), stable_only) is False
+assert ghmon.prereleases_for({"+pre"}, stable_only) is True
+assert ghmon.prereleases_for({"-pre"}, everything) is False
+assert ghmon.prereleases_for({"!overdue"}, everything) is True
+
+# An explicit include_pre argument beats whatever the global setting says.
+assert ghmon.summarize("o/r", mixed_feed, None, stable_only, NOW,
+                       include_pre=True)["tag"] == "v35.0.0rc4"
+assert ghmon.summarize("o/r", mixed_feed, None, everything, NOW,
+                       include_pre=False)["tag"] == "v32.0.15"
+
+# The choice is recorded, which is what lets a changed preference invalidate a
+# cached entry: which release is "latest" depends on it and the feed is gone.
+assert ghmon.summarize("o/r", mixed_feed, None, stable_only, NOW,
+                       include_pre=True)["prereleases_included"] is True
+
+with tempfile.TemporaryDirectory() as tmp:
+    ghmon.REPO_FILE = pathlib.Path(tmp) / "repos.txt"
+    ghmon.CONFIG_DIR = pathlib.Path(tmp)
+    ghmon.save_repo_entries([("a/one", {"!overdue"}), ("b/two", set())])
+
+    ghmon.set_prereleases("a/one", "on")
+    assert ghmon.prereleases_for(dict(ghmon.load_repo_entries())["a/one"], stable_only) is True
+    # Setting one flag must not clear another on the same line.
+    assert "!overdue" in dict(ghmon.load_repo_entries())["a/one"]
+
+    ghmon.set_prereleases("a/one", "off")
+    assert ghmon.prereleases_for(dict(ghmon.load_repo_entries())["a/one"], everything) is False
+    ghmon.set_prereleases("a/one", "default")
+    flags = dict(ghmon.load_repo_entries())["a/one"]
+    assert "+pre" not in flags and "-pre" not in flags
+    assert "!overdue" in flags
+
+print("prerelease control covered")
