@@ -89,6 +89,7 @@ Subcommands:
 - `run` — `fetch` in a loop, for debugging without systemd.
 - `bootstrap` — install and enable the user timer. Never runs implicitly;
   enabling the plugin alone installs nothing, matching mouse-odometer.
+- `list` / `add` / `remove` / `search` — manage the tracked repositories.
 
 Fetching reuses the existing `ThreadPoolExecutor` pattern. Stored ETags make
 repeat polls cheap.
@@ -141,13 +142,56 @@ days_since_release > overdue_factor * avg_days_between_releases
 Requires at least 3 releases in the feed; fewer means no established cadence
 and `overdue` stays false. Default `overdue_factor` is 1.5.
 
+## Tracked repositories
+
+The list lives in a plain text file, `~/.config/omarchy-github-monitor/repos.txt`,
+one `owner/repo` per line, `#` comments and blank lines ignored. This is the
+format `github_monitor.py` already reads from `~/.github_repos.txt`.
+
+It is deliberately not a `manifest.json` setting. A nineteen-entry list is
+miserable to edit in a settings text field, and two places holding the list
+would compete for authority.
+
+Three ways to change it, all writing that one file:
+
+```bash
+omarchy-github-monitor list
+omarchy-github-monitor add foo/bar
+omarchy-github-monitor add https://github.com/foo/bar   # URL accepted
+omarchy-github-monitor remove foo/bar
+```
+
+`add` fetches the repository's atom feed before writing. A `404` means the
+repository does not exist or has published no releases, and it is refused with
+that reason rather than becoming a permanently empty row. On success it
+triggers a refresh so the widget updates at once.
+
+### Search
+
+`omarchy-github-monitor search <query>` queries
+`https://api.github.com/search/repositories`, prints numbered results with star
+counts and descriptions, and `add <n>` takes one.
+
+This is the only place the plugin touches the REST API. It is affordable
+because search has its own budget — **10 requests per minute** unauthenticated,
+independent of the 60/hour core limit that ruled the API out for polling.
+
+The rule that keeps it within that budget: **search runs on Enter, never on
+keystroke.** In the panel this means a field and a button, not a live filter.
+
+GitHub's search qualifiers pass through untouched, so `topic:selfhosted
+stars:>1000` and `user:immich-app` work with no extra code.
+
+Results feed the same `add` path, so a repository without releases cannot be
+added through search either.
+
 ## Settings schema
 
-Exposed through `manifest.json` so they are editable in the bar's settings UI:
+Exposed through `manifest.json` so they are editable in the bar's settings UI.
+Scalars only; the repository list is the file above.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `repos` | string | (the 19 current entries) | newline- or comma-separated `owner/repo` |
 | `pollMinutes` | integer | 15 | timer interval |
 | `newWindowHours` | integer | 24 | how long a release counts as new |
 | `overdueFactor` | number | 1.5 | cadence multiplier before the warning |
@@ -210,9 +254,12 @@ Covers the logic that can silently produce a wrong badge:
 1. Daemon: feed fetching, computation, state file, tests. Verifiable with
    `cat state.json` before any QML exists.
 2. Manifest and bar widget: count, badges, theme colors.
-3. Popup panel: repository list, release notes.
+3. Popup panel: repository list, release notes, add and search views.
 4. Timer, `bootstrap`, notifications.
 5. Token-gated enrichment (commits since tag, exact prerelease).
+
+`list` / `add` / `remove` / `search` ship in phase 1 as CLI subcommands and are
+usable before any QML exists; phase 3 puts a front end on the same code.
 
 Phase 1 stands alone. Each later phase is usable without the ones after it.
 
