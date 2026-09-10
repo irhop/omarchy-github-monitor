@@ -12,6 +12,7 @@ import importlib.util
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import pathlib
 
 # The daemon has no .py extension, so it needs an explicit source loader.
 SOURCE = Path(__file__).parent / "bin" / "omarchy-github-monitor"
@@ -249,3 +250,39 @@ assert ghmon.strip_html("<p>setting the new</p><p>group attribute.</p>") == "set
 assert ghmon.strip_html("<p>First line.</p><p>Second line.</p>") == "First line.\n\nSecond line."
 
 print("hard-wrap joining covered")
+
+
+# ---- muting and unseen state
+
+muted_releases = ghmon.parse_feed(
+    feed([("v1.3.0", days_ago(n, NOW), "") for n in (40, 50, 60, 70)])
+)
+assert ghmon.summarize("o/r", muted_releases, None, opts, NOW)["overdue"] is True
+muted_entry = ghmon.summarize("o/r", muted_releases, None, opts, NOW, muted=True)
+assert muted_entry["overdue"] is False
+assert muted_entry["overdue_muted"] is True
+
+# repos.txt flag round-trip: a flag on one line must survive rewriting another.
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    ghmon.REPO_FILE = pathlib.Path(tmp) / "repos.txt"
+    ghmon.CONFIG_DIR = pathlib.Path(tmp)
+    ghmon.save_repo_entries([("a/one", {"!overdue"}), ("b/two", set())])
+    assert ghmon.load_repos() == ["a/one", "b/two"]
+    assert ghmon.muted_repos() == {"a/one"}
+
+    # Adding a repository must not strip another line's flag.
+    ghmon.save_repo_entries(ghmon.load_repo_entries() + [("c/three", set())])
+    assert ghmon.muted_repos() == {"a/one"}, ghmon.REPO_FILE.read_text()
+
+    ghmon.set_overdue_muted("b/two", True)
+    assert ghmon.muted_repos() == {"a/one", "b/two"}
+    ghmon.set_overdue_muted("a/one", False)
+    assert ghmon.muted_repos() == {"b/two"}
+
+    # A comment on a flagged line is still a comment.
+    ghmon.REPO_FILE.write_text("a/one !overdue  # bursty\n# b/two\n")
+    assert ghmon.load_repos() == ["a/one"]
+    assert ghmon.muted_repos() == {"a/one"}
+
+print("mute and flags covered")

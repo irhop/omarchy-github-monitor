@@ -166,8 +166,38 @@ Panel {
   }
 
   function isNew(entry) {
-    var days = entry.days_since_release
-    return days !== null && days !== undefined && days * 24 <= newWindowHours
+    return entry.unseen === true
+  }
+
+  function markSeen() {
+    seenProcess.command = [monitorBin, "seen"]
+    seenProcess.running = true
+  }
+
+  function toggleMute(entry) {
+    if (!entry || busy) return
+    busy = true
+    muteProcess.command = entry.overdue_muted
+      ? [monitorBin, "mute", "--unmute", entry.repo]
+      : [monitorBin, "mute", entry.repo]
+    muteProcess.running = true
+  }
+
+  Process {
+    id: seenProcess
+    clearEnvironment: true
+    environment: root.monitorEnvironment()
+    onExited: if (root.hostWidget) root.hostWidget.refresh()
+  }
+
+  Process {
+    id: muteProcess
+    clearEnvironment: true
+    environment: root.monitorEnvironment()
+    onExited: {
+      root.busy = false
+      if (root.hostWidget) root.hostWidget.refresh()
+    }
   }
 
   function cadenceText(entry) {
@@ -230,7 +260,15 @@ Panel {
     }
   }
 
-  onOpenedChanged: if (!opened) { selectedRepo = ""; closeAdd() }
+  onOpenedChanged: {
+    if (!opened) {
+      selectedRepo = ""
+      closeAdd()
+      // Closing is the moment you have finished looking, so the dots clear
+      // then rather than the instant the list appears.
+      markSeen()
+    }
+  }
 
   KeyboardPanel {
     id: panel
@@ -419,6 +457,15 @@ Panel {
                 tooltipText: "Copy the tag"
                 foreground: root.foreground
                 onClicked: root.copyToClipboard(root.selected.tag, "tag " + root.selected.tag)
+              }
+
+              PanelActionButton {
+                iconText: root.selected.overdue_muted ? "\uf1f6" : "\uf0f3"
+                tooltipText: root.selected.overdue_muted
+                  ? "Warn again when this one goes quiet"
+                  : "Stop warning when this one goes quiet"
+                foreground: root.selected.overdue_muted ? root.dim : root.foreground
+                onClicked: root.toggleMute(root.selected)
               }
 
               PanelActionButton {

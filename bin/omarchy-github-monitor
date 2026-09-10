@@ -69,7 +69,7 @@ MIN_RELEASES_FOR_CADENCE = 3
 # Bumped whenever parsing or computation changes. Cached entries are reused on
 # an HTTP 304, so without this a logic fix would never reach rows whose feeds
 # had not changed — they would keep serving results the old code produced.
-LOGIC_VERSION = 4
+LOGIC_VERSION = 5
 
 
 # ---------------------------------------------------------------- basics
@@ -157,21 +157,58 @@ def drop_pointer_tags(releases):
 # ---------------------------------------------------------------- config
 
 
-def load_repos():
+def load_repo_entries():
+    """Each tracked line as (repo, flags).
+
+    A line may carry flags after the name: `owner/repo !overdue` tracks the
+    repository but never warns that it is overdue, which is what you want for
+    a project that ships in bursts and will never look regular.
+    """
     if not REPO_FILE.exists():
         return []
-    repos = []
+    entries = []
     for line in REPO_FILE.read_text().splitlines():
         line = line.split("#", 1)[0].strip()
-        if line:
-            repos.append(line)
-    return repos
+        if not line:
+            continue
+        parts = line.split()
+        entries.append((parts[0], set(parts[1:])))
+    return entries
+
+
+def load_repos():
+    return [repo for repo, _ in load_repo_entries()]
+
+
+def muted_repos():
+    return {repo for repo, flags in load_repo_entries() if "!overdue" in flags}
+
+
+def set_overdue_muted(repo, muted):
+    entries = load_repo_entries()
+    changed = []
+    for name, flags in entries:
+        if name == repo:
+            flags = set(flags)
+            flags.discard("!overdue")
+            if muted:
+                flags.add("!overdue")
+        changed.append((name, flags))
+    save_repo_entries(changed)
+
+
+def save_repo_entries(entries):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    header = (
+        "# One owner/repo per line. Edit here or use `omarchy-github-monitor add`.\n"
+        "# Append !overdue to a line to keep tracking it without the overdue warning.\n"
+    )
+    lines = [" ".join([repo] + sorted(flags)) for repo, flags in entries]
+    write_atomic(REPO_FILE, header + "\n".join(lines) + "\n")
 
 
 def save_repos(repos):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    header = "# One owner/repo per line. Edit here or use `omarchy-github-monitor add`.\n"
-    write_atomic(REPO_FILE, header + "\n".join(repos) + "\n")
+    save_repo_entries([(repo, set()) for repo in repos])
 
 
 def normalize_repo(value):
@@ -347,7 +384,7 @@ def is_overdue(days_since, avg_days, release_count, factor):
     return days_since > factor * avg_days
 
 
-def summarize(repo, releases, previous, opts, now):
+def summarize(repo, releases, previous, opts, now, muted=False):
     """Turn a parsed feed into the state-file entry for one repository."""
     if not opts["include_prereleases"]:
         stable = [r for r in releases if not r["prerelease"]]
@@ -379,13 +416,15 @@ def summarize(repo, releases, previous, opts, now):
         "avg_days_between_releases": round(avg_days, 2) if avg_days else None,
         "release_count": len(releases),
         "days_since_release": round(days_since, 2) if days_since is not None else None,
-        "overdue": is_overdue(days_since, avg_days, len(releases), opts["overdue_factor"]),
+        "overdue": (not muted)
+        and is_overdue(days_since, avg_days, len(releases), opts["overdue_factor"]),
+        "overdue_muted": muted,
         "commits_since_tag": (previous or {}).get("commits_since_tag"),
         "error": None,
     }
 
 
-def fetch_repo(repo, previous, opts, now):
+def fetch_repo(repo, previous, opts, now, muted=False):
     """One repository. A failure keeps the last good entry so a dead feed
     cannot blank a row that was fine an hour ago."""
     headers = {}
@@ -399,7 +438,8 @@ def fetch_repo(repo, previous, opts, now):
         return {**(previous or {"repo": repo}), "error": f"unreachable: {exc}"}
 
     if status == 304 and previous:
-        return {**previous, "error": None}
+        return {**previous, "error": None, "overdue": previous.get("overdue", False) and not muted,
+                "overdue_muted": muted}
     if status == 404:
         return {**(previous or {"repo": repo}), "error": "not found or no releases"}
     if status != 200:
@@ -410,7 +450,14 @@ def fetch_repo(repo, previous, opts, now):
     except ET.ParseError as exc:
         return {**(previous or {"repo": repo}), "error": f"malformed feed: {exc}"}
 
-    entry = summarize(repo, releases, previous, opts, now)
+    entry = summarize(repo, releases, previous, opts, now, muted)
+    was = (previous or {}).get("tag")
+    # A tag that differs from the one recorded is unseen until you open the
+    # panel. On a first run there is nothing recorded, so nothing is unseen —
+    # otherwise every repository would arrive shouting.
+    entry["unseen"] = bool(was and entry.get("tag") and entry["tag"] != was) or bool(
+        (previous or {}).get("unseen") and entry.get("tag") == was
+    )
     if response_headers.get("ETag"):
         entry["_etag"] = response_headers["ETag"]
     return entry
@@ -436,6 +483,7 @@ def cmd_fetch(args):
 
     state = load_state()
     opts = settings(state)
+    muted = muted_repos()
     now = now_utc()
     if state.get("logic_version") == LOGIC_VERSION:
         previous = {entry["repo"]: entry for entry in state.get("repos", [])}
@@ -449,7 +497,8 @@ def cmd_fetch(args):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = {
-            pool.submit(fetch_repo, repo, previous.get(repo), opts, now): repo for repo in repos
+            pool.submit(fetch_repo, repo, previous.get(repo), opts, now, repo in muted): repo
+            for repo in repos
         }
         entries = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
 
@@ -507,7 +556,10 @@ def cmd_list(args):
         entry = state.get(repo, {})
         tag = entry.get("tag") or "-"
         age = entry.get("age") or ""
-        mark = " ⚠ overdue" if entry.get("overdue") else ""
+        mark = " ⚠ overdue" if entry.get("overdue") else (
+            " (overdue muted)" if entry.get("overdue_muted") else ""
+        )
+        mark = ("  ●" if entry.get("unseen") else "  ") + mark
         error = f"  ({entry['error']})" if entry.get("error") else ""
         print(f"  {repo:42} {tag:20} {age:>10}{mark}{error}")
     return 0
@@ -546,7 +598,7 @@ def cmd_add(args):
     if status != 200:
         return fail(f"{repo}: HTTP {status}")
 
-    save_repos(repos + [repo])
+    save_repo_entries(load_repo_entries() + [(repo, set())])
     result = cmd_fetch(argparse.Namespace(quiet=True))
     if as_json:
         print(json.dumps({"added": repo, "already": False}))
@@ -561,7 +613,7 @@ def cmd_remove(args):
     if repo not in repos:
         print(f"{repo} is not tracked.", file=sys.stderr)
         return 1
-    save_repos([r for r in repos if r != repo])
+    save_repo_entries([(name, flags) for name, flags in load_repo_entries() if name != repo])
     print(f"Removed {repo}")
     return 0
 
@@ -630,6 +682,33 @@ def cmd_search(args):
 
     print(f"\n  add: {Path(sys.argv[0]).name} add <owner/repo>")
     return 0
+
+
+def cmd_seen(args):
+    """Clear the unseen mark. The panel calls this when you close it."""
+    state = load_state()
+    entries = state.get("repos", [])
+    if not entries:
+        return 0
+    targets = set(args.repo or [])
+    changed = False
+    for entry in entries:
+        if (not targets or entry["repo"] in targets) and entry.get("unseen"):
+            entry["unseen"] = False
+            changed = True
+    if changed:
+        write_atomic(STATE_FILE, json.dumps(state, indent=2))
+    return 0
+
+
+def cmd_mute(args):
+    repo = normalize_repo(args.repo) or args.repo
+    if repo not in load_repos():
+        print(f"{repo} is not tracked.", file=sys.stderr)
+        return 1
+    set_overdue_muted(repo, not args.unmute)
+    print(("Muted" if not args.unmute else "Unmuted") + f" overdue warnings for {repo}")
+    return cmd_fetch(argparse.Namespace(quiet=True))
 
 
 def cmd_status(args):
@@ -718,6 +797,15 @@ def main():
     search.add_argument("-n", "--limit", type=int, default=10)
     search.add_argument("--json", action="store_true", help="machine-readable output, for the panel")
     search.set_defaults(func=cmd_search)
+
+    seen = sub.add_parser("seen", help="clear the unseen mark, all repositories or the named ones")
+    seen.add_argument("repo", nargs="*")
+    seen.set_defaults(func=cmd_seen)
+
+    mute = sub.add_parser("mute", help="keep tracking a repository without overdue warnings")
+    mute.add_argument("repo")
+    mute.add_argument("--unmute", action="store_true")
+    mute.set_defaults(func=cmd_mute)
 
     status = sub.add_parser("status", help="poll cost, search budget, authentication")
     status.set_defaults(func=cmd_status)

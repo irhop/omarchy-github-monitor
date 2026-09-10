@@ -37,12 +37,11 @@ BarWidget {
   readonly property var repos: state && state.repos ? state.repos : []
   readonly property int trackedCount: repos.length
 
+  // Unseen, not recent: the dot should mean "you have not looked at this",
+  // which goes quiet when you do rather than when a timer runs out.
   readonly property int newCount: {
     var count = 0
-    for (var i = 0; i < repos.length; i++) {
-      var days = repos[i].days_since_release
-      if (days !== null && days !== undefined && days * 24 <= newWindowHours) count++
-    }
+    for (var i = 0; i < repos.length; i++) if (repos[i].unseen === true) count++
     return count
   }
 
@@ -76,7 +75,7 @@ BarWidget {
     if (!everRun) return "No poll yet — run: omarchy-github-monitor bootstrap"
     if (stale) return "Feed poll has stopped — check omarchy-github-monitor.timer"
     var parts = [trackedCount + " repositories"]
-    if (newCount > 0) parts.push(newCount + " released in the last " + newWindowHours + "h")
+    if (newCount > 0) parts.push(newCount + " not yet seen")
     if (overdueCount > 0) parts.push(overdueCount + " past their usual cadence")
     return parts.join(" · ")
   }

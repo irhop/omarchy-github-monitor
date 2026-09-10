@@ -49,6 +49,13 @@ If a token happens to be present — `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth
 token` — two extra fields appear: commits since the latest tag, and exact
 prerelease flags. Nothing prompts you for one, and none is ever stored.
 
+## The dot means unseen
+
+Not "released recently". A release you have looked at stops being news, so the
+dot clears when you close the panel rather than when a timer runs out. Nothing
+is unseen on the first poll — otherwise installing this would greet you with
+nineteen notifications.
+
 ## Overdue
 
 The feature no feed reader gives you. Each repository's own average gap
@@ -57,6 +64,17 @@ than 1.5× that gap gets the warning. A project with fewer than three releases
 has no established rhythm, so it is never marked overdue.
 
 Tune the multiplier in the widget's settings.
+
+Some projects ship in bursts and will never look regular. Mute those rather
+than letting the warning lose its meaning — the bell in the notes view, or:
+
+```bash
+omarchy-github-monitor mute Akylas/OSS-DocumentScanner
+omarchy-github-monitor mute --unmute Akylas/OSS-DocumentScanner
+```
+
+Muting appends `!overdue` to that line in `repos.txt`. The repository is still
+tracked and still reports releases; it just never warns.
 
 ## Install
 
@@ -89,6 +107,18 @@ becoming a row that is empty for reasons nobody remembers.
 `search` is the only part that touches the REST API. It has its own budget —
 ten requests a minute, unauthenticated — so it runs when you press Enter, not
 as you type. GitHub's qualifiers work: `topic:selfhosted stars:>1000`.
+
+## Keybindings
+
+Omarchy has no free `SUPER + G` (window grouping) or `SUPER + SHIFT + G`
+(Signal), so:
+
+```lua
+o.bind("SUPER + ALT + R", "GitHub releases", "omarchy-shell github-monitor toggle")
+o.bind("SUPER + ALT + SHIFT + R", "Track a GitHub repository", "omarchy-shell github-monitor add")
+```
+
+Other IPC routes: `poll`, `open`, `close`, `show <owner/repo>`.
 
 ## How it fits together
 
