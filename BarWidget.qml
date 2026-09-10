@@ -230,6 +230,12 @@ BarWidget {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // Open straight to the add view, for a keybind.
+    function add(): void {
+      if (!panelLoader.item) return
+      panelLoader.item.adding = true
+      root.open()
+    }
     // Open straight to one repository's notes, for a keybind or a script.
     function show(repo: string): void {
       if (!panelLoader.item) return

@@ -499,14 +499,25 @@ def cmd_list(args):
 
 
 def cmd_add(args):
+    as_json = getattr(args, "json", False)
+
+    def fail(message):
+        if as_json:
+            print(json.dumps({"error": message}))
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
     repo = normalize_repo(args.repo)
     if not repo:
-        print(f"Not a repository: {args.repo}", file=sys.stderr)
-        return 1
+        return fail(f"Not a repository: {args.repo}")
 
     repos = load_repos()
     if repo in repos:
-        print(f"{repo} is already tracked.")
+        if as_json:
+            print(json.dumps({"added": repo, "already": True}))
+        else:
+            print(f"{repo} is already tracked.")
         return 0
 
     # Validate before writing, so a typo fails here rather than becoming a row
@@ -514,18 +525,19 @@ def cmd_add(args):
     try:
         status, _, _ = http_get(FEED_URL.format(repo=repo))
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        print(f"Could not reach GitHub: {exc}", file=sys.stderr)
-        return 1
+        return fail(f"Could not reach GitHub: {exc}")
     if status == 404:
-        print(f"{repo}: no such repository, or it has never published a release.", file=sys.stderr)
-        return 1
+        return fail(f"{repo}: no such repository, or it has never published a release.")
     if status != 200:
-        print(f"{repo}: HTTP {status}", file=sys.stderr)
-        return 1
+        return fail(f"{repo}: HTTP {status}")
 
     save_repos(repos + [repo])
-    print(f"Added {repo}")
-    return cmd_fetch(argparse.Namespace(quiet=True))
+    result = cmd_fetch(argparse.Namespace(quiet=True))
+    if as_json:
+        print(json.dumps({"added": repo, "already": False}))
+    else:
+        print(f"Added {repo}")
+    return result
 
 
 def cmd_remove(args):
@@ -553,25 +565,43 @@ def cmd_search(args):
         print(f"Could not reach GitHub: {exc}", file=sys.stderr)
         return 1
 
-    if status == 403:
-        reset = response_headers.get("x-ratelimit-reset")
-        wait = max(0, int(reset) - int(time.time())) if reset and reset.isdigit() else None
-        print(
-            "Search rate limit reached"
-            + (f"; {wait}s until it resets." if wait is not None else "."),
-            file=sys.stderr,
-        )
-        return 1
     if status != 200:
-        print(f"Search failed: HTTP {status}", file=sys.stderr)
+        if status == 403:
+            reset = response_headers.get("x-ratelimit-reset")
+            wait = max(0, int(reset) - int(time.time())) if reset and reset.isdigit() else None
+            message = "Search rate limit reached" + (
+                f"; {wait}s until it resets." if wait is not None else "."
+            )
+        else:
+            message = f"Search failed: HTTP {status}"
+        if args.json:
+            print(json.dumps({"error": message}))
+            return 1
+        print(message, file=sys.stderr)
         return 1
 
     items = json.loads(body).get("items", [])
+    tracked = set(load_repos())
+
+    if args.json:
+        print(json.dumps({
+            "items": [
+                {
+                    "repo": item["full_name"],
+                    "stars": item["stargazers_count"],
+                    "description": (item.get("description") or "").replace("\n", " "),
+                    "tracked": item["full_name"] in tracked,
+                }
+                for item in items
+            ],
+            "remaining": response_headers.get("x-ratelimit-remaining"),
+            "limit": response_headers.get("x-ratelimit-limit"),
+        }))
+        return 0
+
     if not items:
         print("No repositories found.")
         return 0
-
-    tracked = set(load_repos())
     for index, item in enumerate(items, 1):
         name = item["full_name"]
         mark = " (tracked)" if name in tracked else ""
@@ -660,7 +690,9 @@ def main():
 
     add = sub.add_parser("add", help="track a repository (owner/repo or URL)")
     add.add_argument("repo")
+    add.add_argument("--json", action="store_true", help="machine-readable output, for the panel")
     add.set_defaults(func=cmd_add)
+
 
     remove = sub.add_parser("remove", help="stop tracking a repository")
     remove.add_argument("repo")
@@ -669,6 +701,7 @@ def main():
     search = sub.add_parser("search", help="search GitHub for repositories to track")
     search.add_argument("query", nargs="+")
     search.add_argument("-n", "--limit", type=int, default=10)
+    search.add_argument("--json", action="store_true", help="machine-readable output, for the panel")
     search.set_defaults(func=cmd_search)
 
     status = sub.add_parser("status", help="poll cost, search budget, authentication")

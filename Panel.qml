@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -23,6 +24,119 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   property string selectedRepo: ""
+
+  // The add/search view. One text field serves both: a value that looks like
+  // a repository is added directly, anything else is searched for.
+  property bool adding: false
+  onAddingChanged: if (adding) Qt.callLater(function () { queryField.forceActiveFocus() })
+  property string query: ""
+  property var results: []
+  property string notice: ""
+  property bool busy: false
+
+  readonly property string monitorBin:
+    Qt.resolvedUrl("bin/omarchy-github-monitor").toString().replace("file://", "")
+
+  // A child that installs nothing still has no business inheriting whatever
+  // environment the compositor was started with.
+  function monitorEnvironment() {
+    var env = { "PATH": "/usr/local/bin:/usr/bin:/bin" }
+    var keep = ["HOME", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+    for (var i = 0; i < keep.length; i++) {
+      var value = Quickshell.env(keep[i])
+      if (value) env[keep[i]] = value
+    }
+    return env
+  }
+
+  // `owner/repo` or a github.com URL is unambiguous, so it is added rather
+  // than searched for. Everything else is a search query.
+  function looksLikeRepo(value) {
+    var trimmed = value.trim()
+    if (trimmed.indexOf("github.com/") >= 0) return true
+    return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(trimmed)
+  }
+
+  function submitQuery() {
+    var value = query.trim()
+    if (value === "" || busy) return
+    notice = ""
+    busy = true
+    if (looksLikeRepo(value)) {
+      addProcess.command = [monitorBin, "add", "--json", value]
+      addProcess.running = true
+    } else {
+      // On Enter, never per keystroke: search allows ten requests a minute.
+      searchProcess.command = [monitorBin, "search", "--json", "-n", "12", value]
+      searchProcess.running = true
+    }
+  }
+
+  function addRepo(repo) {
+    if (busy) return
+    busy = true
+    notice = ""
+    addProcess.command = [monitorBin, "add", "--json", repo]
+    addProcess.running = true
+  }
+
+  function closeAdd() {
+    adding = false
+    query = ""
+    results = []
+    notice = ""
+  }
+
+  Process {
+    id: searchProcess
+    clearEnvironment: true
+    environment: root.monitorEnvironment()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.busy = false
+        try {
+          var payload = JSON.parse(text)
+          if (payload.error) {
+            root.notice = payload.error
+            root.results = []
+          } else {
+            root.results = payload.items || []
+            root.notice = root.results.length === 0 ? "No repositories found." : ""
+          }
+        } catch (e) {
+          root.notice = "Search failed."
+          root.results = []
+        }
+      }
+    }
+  }
+
+  Process {
+    id: addProcess
+    clearEnvironment: true
+    environment: root.monitorEnvironment()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.busy = false
+        try {
+          var payload = JSON.parse(text)
+          if (payload.error) {
+            root.notice = payload.error
+          } else {
+            root.notice = payload.already ? payload.added + " is already tracked."
+                                          : "Added " + payload.added
+            root.query = ""
+            root.results = []
+            if (root.hostWidget) root.hostWidget.refresh()
+          }
+        } catch (e) {
+          root.notice = "Could not add that repository."
+        }
+      }
+    }
+  }
 
   readonly property var repos: hostWidget ? hostWidget.repos : []
   readonly property bool stale: hostWidget ? hostWidget.stale : false
@@ -72,7 +186,7 @@ Panel {
     Quickshell.execDetached(["xdg-open", url])
   }
 
-  onOpenedChanged: if (!opened) selectedRepo = ""
+  onOpenedChanged: if (!opened) { selectedRepo = ""; closeAdd() }
 
   KeyboardPanel {
     id: panel
@@ -80,6 +194,9 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
+    // Without this the layer surface never takes keyboard focus, and the
+    // query field silently ignores every keystroke.
+    focusTarget: root.adding ? queryField : null
     contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(Style.space(400), Style.space(620))
 
@@ -87,16 +204,132 @@ Panel {
     anchors.fill: parent
     spacing: Style.space(8)
 
-    PanelSectionHeader {
+    RowLayout {
       Layout.fillWidth: true
-      text: root.selected ? root.selected.repo : "Tracked repositories"
+      spacing: Style.space(8)
+
+      PanelSectionHeader {
+        Layout.fillWidth: true
+        foreground: root.foreground
+        text: root.adding ? "Add a repository"
+                          : (root.selected ? root.selected.repo : "Tracked repositories")
+      }
+
+      PanelActionButton {
+        visible: !root.adding && root.selected === null
+        iconText: "\uf067"
+        tooltipText: "Add a repository"
+        foreground: root.foreground
+        onClicked: {
+          root.adding = true
+          Qt.callLater(function () { queryField.forceActiveFocus() })
+        }
+      }
+    }
+
+    // ---- add and search
+    ColumnLayout {
+      Layout.fillWidth: true
+      Layout.fillHeight: true
+      visible: root.adding
+      spacing: Style.space(8)
+
+      TextField {
+        id: queryField
+        Layout.fillWidth: true
+        foreground: root.foreground
+        placeholderText: "owner/repo, a github.com URL, or words to search for"
+        text: root.query
+        enabled: !root.busy
+        onTextChanged: root.query = text
+        // Enter, never per keystroke: search allows ten requests a minute.
+        onAccepted: root.submitQuery()
+        Keys.onEscapePressed: root.closeAdd()
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        visible: root.notice !== "" || root.busy
+        text: root.busy ? "working…" : root.notice
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        color: root.dim
+      }
+
+      ListView {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        clip: true
+        spacing: Style.space(2)
+        model: root.results
+
+        delegate: Rectangle {
+          required property var modelData
+          width: ListView.view.width
+          height: Style.space(34)
+          radius: Style.space(4)
+          color: resultMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
+                                           : "transparent"
+
+          RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(8)
+            anchors.rightMargin: Style.space(8)
+            spacing: Style.space(8)
+
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 0
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                text: modelData.repo + (modelData.tracked ? "  (tracked)" : "")
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                color: modelData.tracked ? root.dim : root.foreground
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                text: modelData.description || ""
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                color: root.dim
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: modelData.stars >= 1000 ? Math.round(modelData.stars / 100) / 10 + "k★"
+                                            : modelData.stars + "★"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              color: root.dim
+            }
+          }
+
+          MouseArea {
+            id: resultMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: !modelData.tracked && !root.busy
+            onClicked: root.addRepo(modelData.repo)
+          }
+        }
+      }
     }
 
     // ---- release notes for the selected row
     Loader {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      active: root.selected !== null
+      active: root.selected !== null && !root.adding
       visible: active
 
       sourceComponent: Item {
@@ -138,7 +371,7 @@ Panel {
     ListView {
       Layout.fillWidth: true
       Layout.fillHeight: true
-      visible: root.selected === null
+      visible: root.selected === null && !root.adding
       clip: true
       spacing: Style.space(2)
       model: root.sorted
@@ -239,7 +472,7 @@ Panel {
         iconText: ""
         tooltipText: "Back to the list"
         foreground: root.foreground
-        onClicked: root.selectedRepo = ""
+        onClicked: { if (root.adding) root.closeAdd(); else root.selectedRepo = "" }
       }
 
       PanelActionButton {
