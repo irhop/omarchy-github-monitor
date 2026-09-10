@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll GitHub release feeds every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+# A poll missed while suspended runs on resume rather than being skipped.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

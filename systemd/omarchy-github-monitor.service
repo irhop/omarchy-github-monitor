@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy GitHub release monitor — poll releases.atom feeds
+Documentation=file:%h/.config/omarchy/plugins/io.github.irhop.github-monitor/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ fetch --quiet
+# Polling public feeds needs no privilege at all.
+NoNewPrivileges=yes
+PrivateTmp=yes
+StateDirectory=omarchy-github-monitor
+# Never let feed polling compete with anything the user is doing.
+Nice=10
+IOSchedulingClass=idle

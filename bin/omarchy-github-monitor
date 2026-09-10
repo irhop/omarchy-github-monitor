@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""Track GitHub releases without credentials, for the Omarchy bar.
+
+Polling reads each repository's releases.atom feed, which costs nothing against
+the REST API's 60/hour unauthenticated budget and needs no token. The daemon
+writes a JSON state file; the bar widget reads it and nothing else.
+
+A token is used when one happens to be present, for two enrichment fields, and
+is never asked for or stored. See docs/design.md.
+"""
+
+import argparse
+import concurrent.futures
+import gzip
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
+FEED_URL = "https://github.com/{repo}/releases.atom"
+SEARCH_URL = "https://api.github.com/search/repositories"
+USER_AGENT = "omarchy-github-monitor (+https://github.com/irhop)"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy-github-monitor"
+REPO_FILE = CONFIG_DIR / "repos.txt"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omarchy-github-monitor"
+STATE_FILE = STATE_DIR / "state.json"
+
+# Feed entry ids look like tag:github.com,2008:Repository/1234/v1.2.3
+TAG_FROM_ID = re.compile(r"/([^/]+)$")
+# Matches a prerelease marker whether it is separated (v1.2.0-rc.1) or run
+# straight onto the version, which nextcloud does (v35.0.0rc4).
+PRERELEASE_TAG = re.compile(
+    r"(?:[-._]|\d)(?:rc|alpha|beta|pre|preview|next|canary|snapshot)[-._]?\d*\b", re.I
+)
+# Tags that name a moving target rather than a release. GitHub lists them in
+# the feed every time they are re-pointed, which makes a project look like it
+# ships several times a day and destroys any cadence computed from it.
+POINTER_TAG = re.compile(
+    r"^(?:stable|latest|nightly|edge|canary|main|master|head|release|dev|prerelease|unstable)$",
+    re.I,
+)
+BARE_MAJOR = re.compile(r"^v?\d+$")
+HTML_TAG = re.compile(r"<[^>]+>")
+DOCTYPE = re.compile(r"<!DOCTYPE", re.I)
+REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+DEFAULTS = {
+    "poll_minutes": 15,
+    "new_window_hours": 24,
+    "overdue_factor": 1.5,
+    "include_prereleases": False,
+    "notify": True,
+}
+
+# A cadence needs enough releases to be a cadence rather than a coincidence.
+MIN_RELEASES_FOR_CADENCE = 3
+
+# Bumped whenever parsing or computation changes. Cached entries are reused on
+# an HTTP 304, so without this a logic fix would never reach rows whose feeds
+# had not changed — they would keep serving results the old code produced.
+LOGIC_VERSION = 2
+
+
+# ---------------------------------------------------------------- basics
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def parse_iso8601(dt_str):
+    """Parse the timestamps GitHub emits. Returns None rather than raising."""
+    if not dt_str:
+        return None
+    try:
+        if dt_str.endswith("Z"):
+            return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(dt_str)
+    except ValueError:
+        return None
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def human_age(dt, now):
+    seconds = (now - dt).total_seconds()
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)}m ago"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{int(hours)}h ago"
+    return f"{int(hours / 24)}d ago"
+
+
+def strip_html(text):
+    """Release notes are third-party text bound for the user's bar. Flatten it
+    to plain text here so no markup ever reaches QML."""
+    if not text:
+        return ""
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", text)
+    text = re.sub(r"(?i)<li[^>]*>", "• ", text)
+    text = HTML_TAG.sub("", text)
+    text = html.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
+
+
+def is_prerelease(tag):
+    return bool(PRERELEASE_TAG.search(tag or ""))
+
+
+def drop_pointer_tags(releases):
+    """Remove rolling tags, which are pointers rather than releases.
+
+    Named pointers (`stable`, `nightly`) always go. A bare major like `v1` goes
+    only when the same feed carries properly versioned tags, since a project
+    whose every tag is a bare number is using them as real releases.
+    """
+    kept = [r for r in releases if not POINTER_TAG.match(r["tag"])]
+    versioned = [r for r in kept if not BARE_MAJOR.match(r["tag"])]
+    return versioned if versioned and len(versioned) < len(kept) else kept
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_repos():
+    if not REPO_FILE.exists():
+        return []
+    repos = []
+    for line in REPO_FILE.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            repos.append(line)
+    return repos
+
+
+def save_repos(repos):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    header = "# One owner/repo per line. Edit here or use `omarchy-github-monitor add`.\n"
+    write_atomic(REPO_FILE, header + "\n".join(repos) + "\n")
+
+
+def normalize_repo(value):
+    """Accept owner/repo, or a github.com URL pointing at one.
+
+    The host check matters: without it a GitLab or Codeberg URL would be
+    reduced to owner/repo and then tracked as though it were on GitHub, where
+    it either does not exist or is somebody else's project entirely.
+    """
+    value = value.strip()
+    if value.startswith(("http://", "https://", "github.com/", "www.github.com/")):
+        parsed = urllib.parse.urlparse(value if "//" in value else "https://" + value)
+        if parsed.hostname not in ("github.com", "www.github.com"):
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            return None
+        value = f"{parts[0]}/{parts[1]}"
+    if value.endswith(".git"):
+        value = value[: -len(".git")]
+    return value if REPO_NAME.match(value) else None
+
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def write_atomic(path, text):
+    """Temp file beside the target, then replace. A reader never sees a partial
+    file, which matters because QML watches this one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def settings(state):
+    merged = dict(DEFAULTS)
+    merged.update(state.get("settings") or {})
+    return merged
+
+
+# ---------------------------------------------------------------- http
+
+
+# A releases.atom feed with ten entries runs well under a megabyte. Ten times
+# that is generous and still bounds what a hostile response can cost us.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+def http_get(url, headers=None, timeout=15):
+    """Returns (status, headers, body_text). 304 and 404 are outcomes, not
+    errors; anything else that fails raises."""
+    request = urllib.request.Request(url)
+    request.add_header("User-Agent", USER_AGENT)
+    request.add_header("Accept-Encoding", "gzip")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                raise ValueError(f"response larger than {MAX_BODY_BYTES} bytes")
+            if response.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)[:MAX_BODY_BYTES]
+            return response.status, dict(response.headers), raw.decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        body = ""
+        if exc.code not in (304,):
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+        return exc.code, dict(exc.headers or {}), body
+
+
+def find_token():
+    """First hit wins. Never stored, never logged, never written to state."""
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        value = os.environ.get(var)
+        if value:
+            return value, var
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
+        )
+        token = result.stdout.strip()
+        if result.returncode == 0 and token:
+            return token, "gh auth token"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None, None
+
+
+# ---------------------------------------------------------------- feed
+
+
+def parse_feed(xml_text):
+    """Extract releases from a releases.atom document, newest first.
+
+    ElementTree does not resolve external entities, but it does expand internal
+    ones, which is the billion-laughs shape. A real releases.atom carries no
+    doctype at all, so refusing one costs nothing and removes the only entity
+    vector without pulling in defusedxml. http_get caps the body size, which
+    covers the other half (a feed large enough to exhaust memory on its own).
+    """
+    if DOCTYPE.search(xml_text[:4096]):
+        raise ET.ParseError("feed declares a doctype; refusing to parse")
+    root = ET.fromstring(xml_text)
+    releases = []
+    for entry in root.findall("a:entry", ATOM_NS):
+        title = entry.findtext("a:title", default="", namespaces=ATOM_NS).strip()
+        entry_id = entry.findtext("a:id", default="", namespaces=ATOM_NS)
+        updated = entry.findtext("a:updated", default="", namespaces=ATOM_NS)
+        content_el = entry.find("a:content", ATOM_NS)
+        # itertext, not .text: GitHub escapes the notes, but a feed that nests
+        # real XHTML would otherwise be truncated at the first child element.
+        content = "".join(content_el.itertext()) if content_el is not None else ""
+        link = entry.find("a:link", ATOM_NS)
+
+        # The title is the release name, which may be anything; the id ends in
+        # the tag, which is what identifies the release.
+        match = TAG_FROM_ID.search(entry_id or "")
+        tag = match.group(1) if match else title
+
+        releases.append(
+            {
+                "tag": tag,
+                "name": title,
+                "published_at": updated,
+                "url": link.get("href") if link is not None else "",
+                "notes": strip_html(content),
+                "prerelease": is_prerelease(tag),
+            }
+        )
+
+    # GitHub does not guarantee the feed is ordered by date — a re-pointed tag
+    # can appear ahead of a newer real release — so order it ourselves.
+    releases = drop_pointer_tags(releases)
+    releases.sort(
+        key=lambda r: parse_iso8601(r["published_at"]) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return releases
+
+
+def avg_days_between_releases(releases):
+    """Mean gap between consecutive releases, in days. None when there are
+    fewer than two dated releases to compare."""
+    dates = [parse_iso8601(r["published_at"]) for r in releases]
+    dates = sorted((d for d in dates if d), reverse=True)
+    if len(dates) < 2:
+        return None
+    gaps = [
+        (dates[i] - dates[i + 1]).total_seconds() / 86400.0 for i in range(len(dates) - 1)
+    ]
+    gaps = [g for g in gaps if g >= 0]
+    return sum(gaps) / len(gaps) if gaps else None
+
+
+def is_overdue(days_since, avg_days, release_count, factor):
+    """A repository past its own rhythm. Needs an established rhythm first:
+    two releases can be a coincidence, so require MIN_RELEASES_FOR_CADENCE."""
+    if avg_days is None or days_since is None:
+        return False
+    if release_count < MIN_RELEASES_FOR_CADENCE or avg_days <= 0:
+        return False
+    return days_since > factor * avg_days
+
+
+def summarize(repo, releases, previous, opts, now):
+    """Turn a parsed feed into the state-file entry for one repository."""
+    if not opts["include_prereleases"]:
+        stable = [r for r in releases if not r["prerelease"]]
+        if stable:
+            releases = stable
+
+    if not releases:
+        return {
+            "repo": repo,
+            "tag": None,
+            "error": "no releases in feed",
+            "release_count": 0,
+        }
+
+    latest = releases[0]
+    published = parse_iso8601(latest["published_at"])
+    days_since = (now - published).total_seconds() / 86400.0 if published else None
+    avg_days = avg_days_between_releases(releases)
+
+    return {
+        "repo": repo,
+        "tag": latest["tag"],
+        "name": latest["name"],
+        "published_at": latest["published_at"],
+        "age": human_age(published, now) if published else None,
+        "url": latest["url"],
+        "notes": latest["notes"],
+        "prerelease": latest["prerelease"],
+        "avg_days_between_releases": round(avg_days, 2) if avg_days else None,
+        "release_count": len(releases),
+        "days_since_release": round(days_since, 2) if days_since is not None else None,
+        "overdue": is_overdue(days_since, avg_days, len(releases), opts["overdue_factor"]),
+        "commits_since_tag": (previous or {}).get("commits_since_tag"),
+        "error": None,
+    }
+
+
+def fetch_repo(repo, previous, opts, now):
+    """One repository. A failure keeps the last good entry so a dead feed
+    cannot blank a row that was fine an hour ago."""
+    headers = {}
+    etag = (previous or {}).get("_etag")
+    if etag:
+        headers["If-None-Match"] = etag
+
+    try:
+        status, response_headers, body = http_get(FEED_URL.format(repo=repo), headers)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return {**(previous or {"repo": repo}), "error": f"unreachable: {exc}"}
+
+    if status == 304 and previous:
+        return {**previous, "error": None}
+    if status == 404:
+        return {**(previous or {"repo": repo}), "error": "not found or no releases"}
+    if status != 200:
+        return {**(previous or {"repo": repo}), "error": f"HTTP {status}"}
+
+    try:
+        releases = parse_feed(body)
+    except ET.ParseError as exc:
+        return {**(previous or {"repo": repo}), "error": f"malformed feed: {exc}"}
+
+    entry = summarize(repo, releases, previous, opts, now)
+    if response_headers.get("ETag"):
+        entry["_etag"] = response_headers["ETag"]
+    return entry
+
+
+# ---------------------------------------------------------------- commands
+
+
+def notify(title, message):
+    for command in (["omarchy-notification-send", title, message], ["notify-send", title, message]):
+        try:
+            subprocess.run(command, check=True, capture_output=True, timeout=5)
+            return
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+
+def cmd_fetch(args):
+    repos = load_repos()
+    if not repos:
+        print(f"No repositories tracked. Add one:\n  {sys.argv[0]} add owner/repo", file=sys.stderr)
+        return 1
+
+    state = load_state()
+    opts = settings(state)
+    now = now_utc()
+    if state.get("logic_version") == LOGIC_VERSION:
+        previous = {entry["repo"]: entry for entry in state.get("repos", [])}
+    else:
+        # Keep the tags, for notification comparison, but drop the ETags so
+        # every feed is re-fetched and re-parsed by the current code.
+        previous = {
+            entry["repo"]: {k: v for k, v in entry.items() if k != "_etag"}
+            for entry in state.get("repos", [])
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(fetch_repo, repo, previous.get(repo), opts, now): repo for repo in repos
+        }
+        entries = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
+
+    ordered = [entries[repo] for repo in repos]
+
+    # Notify only for tags that differ from the ones already recorded. On a
+    # first run there is nothing recorded, and 19 notifications would be a
+    # poor introduction, so that run only establishes the baseline.
+    if opts["notify"] and previous:
+        for entry in ordered:
+            was = previous.get(entry["repo"], {}).get("tag")
+            if entry.get("tag") and was and entry["tag"] != was:
+                notify(f"{entry['repo']} {entry['tag']}", (entry.get("notes") or "")[:200])
+
+    token, _ = find_token()
+    write_atomic(
+        STATE_FILE,
+        json.dumps(
+            {
+                "generated_at": iso(now),
+                "logic_version": LOGIC_VERSION,
+                "poll_interval_seconds": opts["poll_minutes"] * 60,
+                "authenticated": bool(token),
+                "settings": state.get("settings", {}),
+                "repos": ordered,
+            },
+            indent=2,
+        ),
+    )
+
+    failed = [e for e in ordered if e.get("error")]
+    if not args.quiet:
+        new = sum(1 for e in ordered if e.get("days_since_release") is not None
+                  and e["days_since_release"] * 24 <= opts["new_window_hours"])
+        overdue = sum(1 for e in ordered if e.get("overdue"))
+        print(f"{len(ordered)} repos, {new} new, {overdue} overdue, {len(failed)} failed")
+        for entry in failed:
+            print(f"  {entry['repo']}: {entry['error']}", file=sys.stderr)
+    return 0
+
+
+def cmd_run(args):
+    while True:
+        cmd_fetch(args)
+        time.sleep(settings(load_state())["poll_minutes"] * 60)
+
+
+def cmd_list(args):
+    repos = load_repos()
+    if not repos:
+        print("No repositories tracked.")
+        return 0
+    state = {entry["repo"]: entry for entry in load_state().get("repos", [])}
+    for repo in repos:
+        entry = state.get(repo, {})
+        tag = entry.get("tag") or "-"
+        age = entry.get("age") or ""
+        mark = " ⚠ overdue" if entry.get("overdue") else ""
+        error = f"  ({entry['error']})" if entry.get("error") else ""
+        print(f"  {repo:42} {tag:20} {age:>10}{mark}{error}")
+    return 0
+
+
+def cmd_add(args):
+    repo = normalize_repo(args.repo)
+    if not repo:
+        print(f"Not a repository: {args.repo}", file=sys.stderr)
+        return 1
+
+    repos = load_repos()
+    if repo in repos:
+        print(f"{repo} is already tracked.")
+        return 0
+
+    # Validate before writing, so a typo fails here rather than becoming a row
+    # that is permanently empty for reasons nobody remembers.
+    try:
+        status, _, _ = http_get(FEED_URL.format(repo=repo))
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"Could not reach GitHub: {exc}", file=sys.stderr)
+        return 1
+    if status == 404:
+        print(f"{repo}: no such repository, or it has never published a release.", file=sys.stderr)
+        return 1
+    if status != 200:
+        print(f"{repo}: HTTP {status}", file=sys.stderr)
+        return 1
+
+    save_repos(repos + [repo])
+    print(f"Added {repo}")
+    return cmd_fetch(argparse.Namespace(quiet=True))
+
+
+def cmd_remove(args):
+    repo = normalize_repo(args.repo) or args.repo
+    repos = load_repos()
+    if repo not in repos:
+        print(f"{repo} is not tracked.", file=sys.stderr)
+        return 1
+    save_repos([r for r in repos if r != repo])
+    print(f"Removed {repo}")
+    return 0
+
+
+def cmd_search(args):
+    query = " ".join(args.query)
+    url = f"{SEARCH_URL}?{urllib.parse.urlencode({'q': query, 'sort': 'stars', 'per_page': args.limit})}"
+    headers = {}
+    token, _ = find_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        status, response_headers, body = http_get(url, headers)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"Could not reach GitHub: {exc}", file=sys.stderr)
+        return 1
+
+    if status == 403:
+        reset = response_headers.get("x-ratelimit-reset")
+        wait = max(0, int(reset) - int(time.time())) if reset and reset.isdigit() else None
+        print(
+            "Search rate limit reached"
+            + (f"; {wait}s until it resets." if wait is not None else "."),
+            file=sys.stderr,
+        )
+        return 1
+    if status != 200:
+        print(f"Search failed: HTTP {status}", file=sys.stderr)
+        return 1
+
+    items = json.loads(body).get("items", [])
+    if not items:
+        print("No repositories found.")
+        return 0
+
+    tracked = set(load_repos())
+    for index, item in enumerate(items, 1):
+        name = item["full_name"]
+        mark = " (tracked)" if name in tracked else ""
+        description = (item.get("description") or "").replace("\n", " ")[:52]
+        print(f"  {index:2}  {name:38} {item['stargazers_count']:>7}*  {description}{mark}")
+
+    remaining = response_headers.get("x-ratelimit-remaining")
+    limit = response_headers.get("x-ratelimit-limit")
+    if remaining and limit and int(remaining) <= 3:
+        print(f"\n  {remaining} of {limit} searches left this minute")
+
+    print(f"\n  add: {Path(sys.argv[0]).name} add <owner/repo>")
+    return 0
+
+
+def cmd_status(args):
+    repos = load_repos()
+    state = load_state()
+    opts = settings(state)
+    token, source = find_token()
+
+    generated = parse_iso8601(state.get("generated_at", ""))
+    freshness = human_age(generated, now_utc()) if generated else "never run"
+
+    print(f"  {len(repos)} repos, polled every {opts['poll_minutes']}m via releases.atom   0 API requests")
+    print(f"  last poll{'':38}{freshness}")
+
+    try:
+        status, headers, _ = http_get(f"{SEARCH_URL}?q=omarchy&per_page=1")
+        if status == 200:
+            print(f"  search{'':41}{headers.get('x-ratelimit-limit', '?')}/min, "
+                  f"{headers.get('x-ratelimit-remaining', '?')} left")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        print("  search                                         unreachable")
+
+    print(f"  authentication{'':33}{source if token else 'none'}")
+    if not token:
+        print("\n  Authenticating adds: commits since latest tag, exact prerelease flags")
+        print("  Any of these is picked up automatically:")
+        print("    gh auth login          (recommended, browser flow, nothing to copy)")
+        print("    GITHUB_TOKEN=...       in the environment")
+        print("    GH_TOKEN=...")
+    return 0
+
+
+def cmd_bootstrap(args):
+    plugin_dir = Path(__file__).resolve().parent.parent
+    unit_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    for unit in ("omarchy-github-monitor.service", "omarchy-github-monitor.timer"):
+        source = plugin_dir / "systemd" / unit
+        text = source.read_text().replace("@BIN@", str(plugin_dir / "bin/omarchy-github-monitor"))
+        if args.dry_run:
+            print(f"would write {unit_dir / unit}")
+        else:
+            (unit_dir / unit).write_text(text)
+
+    if args.dry_run:
+        print("would run: systemctl --user daemon-reload")
+        print("would run: systemctl --user enable --now omarchy-github-monitor.timer")
+        return 0
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(
+        ["systemctl", "--user", "enable", "--now", "omarchy-github-monitor.timer"], check=True
+    )
+    print("Timer enabled. First poll runs now.")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-github-monitor", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    fetch = sub.add_parser("fetch", help="poll every tracked repository once")
+    fetch.add_argument("-q", "--quiet", action="store_true")
+    fetch.set_defaults(func=cmd_fetch)
+
+    run = sub.add_parser("run", help="poll in a loop (debugging; the timer is the real path)")
+    run.add_argument("-q", "--quiet", action="store_true")
+    run.set_defaults(func=cmd_run)
+
+    listing = sub.add_parser("list", help="show tracked repositories")
+    listing.set_defaults(func=cmd_list)
+
+    add = sub.add_parser("add", help="track a repository (owner/repo or URL)")
+    add.add_argument("repo")
+    add.set_defaults(func=cmd_add)
+
+    remove = sub.add_parser("remove", help="stop tracking a repository")
+    remove.add_argument("repo")
+    remove.set_defaults(func=cmd_remove)
+
+    search = sub.add_parser("search", help="search GitHub for repositories to track")
+    search.add_argument("query", nargs="+")
+    search.add_argument("-n", "--limit", type=int, default=10)
+    search.set_defaults(func=cmd_search)
+
+    status = sub.add_parser("status", help="poll cost, search budget, authentication")
+    status.set_defaults(func=cmd_status)
+
+    bootstrap = sub.add_parser("bootstrap", help="install and enable the systemd user timer")
+    bootstrap.add_argument("--dry-run", action="store_true")
+    bootstrap.set_defaults(func=cmd_bootstrap)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
