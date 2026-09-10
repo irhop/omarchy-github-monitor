@@ -109,27 +109,32 @@ becoming a row that is empty for reasons nobody remembers.
 ten requests a minute, unauthenticated — so it runs when you press Enter, not
 as you type. GitHub's qualifiers work: `topic:selfhosted stars:>1000`.
 
-## What are you actually running?
+## What have you actually got installed?
 
 A release matters when you are behind it, not when it exists.
 
 ```bash
-omarchy-github-monitor containers            # all Docker contexts
-omarchy-github-monitor containers asgard     # one host
+omarchy-github-monitor installed             # this machine and every Docker context
+omarchy-github-monitor installed asgard      # one host
+omarchy-github-monitor installed --remote-only
 ```
 
 ```
-  Tracked repositories you are running
+  Tracked repositories you have installed
 
-  jellyfin/jellyfin      released v12.0    running 10.11.11    asgard    ▲ behind
+  anomalyco/opencode   released v1.18.30   installed 1.18.25    mise      ▲ behind
+  atuinsh/atuin        released v18.22.0   installed 18.21.0    pacman    ▲ behind
+  jellyfin/jellyfin    released v12.0      installed 10.11.11   asgard    ▲ behind
 
   Running but not tracked
 
   vaultwarden    vaultwarden/server:latest    heimdall    add dani-garcia/vaultwarden
 ```
 
-It reads `docker context ls`, so any host you already reach with the Docker
-CLI works. Deliberately a command you run rather than part of the poll: a
+Rows that are behind come first. Three sources, none of them guessing at
+names: `pacman -Qi` reports each package's declared upstream URL, `mise
+registry` maps a tool to its backend repository, and Docker containers carry
+the OCI source label. Every host you already reach with the Docker CLI works. Deliberately a command you run rather than part of the poll: a
 context on a Tailscale SSH endpoint can block on an interactive check, and a
 timer that stalls on a browser prompt nobody sees is worse than no feature.
 Every host call carries a timeout and an unreachable host says so.

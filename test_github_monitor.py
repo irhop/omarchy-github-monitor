@@ -382,3 +382,38 @@ assert ghmon.is_overdue(30, 0.5, 10, 1.5) is False       # twice a day, gone qui
 assert ghmon.is_overdue(30, ghmon.MIN_CADENCE_DAYS, 10, 1.5) is True
 
 print("cadence floor covered")
+
+
+# ---- local installs
+
+for url, expected in [
+    ("https://github.com/atuinsh/atuin", "atuinsh/atuin"),
+    ("https://github.com/atuinsh/atuin/", "atuinsh/atuin"),
+    ("https://github.com/atuinsh/atuin.git", "atuinsh/atuin"),
+    ("git@github.com:atuinsh/atuin.git", "atuinsh/atuin"),
+    ("https://gitlab.com/foo/bar", None),
+    ("https://atuin.sh", None),
+    ("", None),
+    (None, None),
+]:
+    assert ghmon.repo_from_url(url) == expected, url
+
+# A package declaring its upstream is matched on that claim, not on its name.
+package = {"host": "local", "name": "atuin", "source_repo": "atuinsh/atuin",
+           "via": "pacman", "version": "18.21.0"}
+assert ghmon.image_repo_candidates(package) == ["atuinsh/atuin"]
+by_repo, unmatched = ghmon.match_containers(["atuinsh/atuin"], [package], {})
+assert by_repo["atuinsh/atuin"] == [package]
+assert unmatched == []
+
+# An entry with neither an image nor a declared upstream matches nothing
+# rather than raising.
+assert ghmon.image_repo_candidates({"name": "mystery"}) == []
+
+# pacman's package release is not part of the upstream version: 18.21.0-1 is
+# upstream 18.21.0 packaged once, and comparing the release would report every
+# package as differing from its own tag.
+assert ghmon.compare_versions("v18.21.0", "18.21.0") == "current"
+assert ghmon.compare_versions("v18.22.0", "18.21.0") == "behind"
+
+print("local install matching covered")

@@ -765,6 +765,84 @@ VERSION_TAG = re.compile(r"^v?\d+(\.\d+)*([.-][A-Za-z0-9.]+)?$")
 NUMERIC_VERSION = re.compile(r"(\d+(?:\.\d+)*)")
 
 
+GITHUB_URL = re.compile(r"github\.com[/:]([^/\s]+/[^/\s#?]+?)(?:\.git)?/?$")
+
+
+def repo_from_url(url):
+    match = GITHUB_URL.search((url or "").strip())
+    return match.group(1) if match else None
+
+
+def pacman_packages():
+    """Installed packages that name a GitHub project as their upstream.
+
+    `pacman -Qi` reports the URL each package declares, so the mapping is the
+    package's own claim rather than a guess from its name — the same reason
+    the container matcher prefers the OCI source label.
+    """
+    try:
+        result = subprocess.run(["pacman", "-Qi"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    found, name, version = [], None, None
+    for line in result.stdout.splitlines():
+        if line.startswith("Name "):
+            name, version = line.split(":", 1)[1].strip(), None
+        elif line.startswith("Version "):
+            version = line.split(":", 1)[1].strip()
+        elif line.startswith("URL ") and name:
+            repo = repo_from_url(line.split(":", 1)[1])
+            if repo:
+                # pacman appends a package release: 18.21.0-1 is upstream
+                # 18.21.0 packaged once. Comparing the release would report
+                # every package as different from its own upstream tag.
+                found.append({"host": "local", "name": name, "source_repo": repo,
+                              "via": "pacman", "version": (version or "").rsplit("-", 1)[0]})
+    return found
+
+
+def mise_tools():
+    """Installed mise tools, mapped through the registry's backend id."""
+    try:
+        registry = subprocess.run(["mise", "registry"], capture_output=True, text=True, timeout=20)
+        listed = subprocess.run(["mise", "ls", "--installed", "--json"],
+                                capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if registry.returncode != 0 or listed.returncode != 0:
+        return []
+
+    backends = {}
+    for line in registry.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            for backend in parts[1:]:
+                if ":" in backend:
+                    candidate = backend.split(":", 1)[1]
+                    if candidate.count("/") == 1:
+                        backends.setdefault(parts[0], candidate)
+                        break
+
+    try:
+        installed = json.loads(listed.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    found = []
+    for tool, versions in installed.items():
+        repo = backends.get(tool)
+        if not repo or not versions:
+            continue
+        # The active version is the one mise would run, not the newest kept.
+        active = next((v for v in versions if v.get("active") or v.get("source")), versions[-1])
+        found.append({"host": "local", "name": tool, "source_repo": repo,
+                      "via": "mise", "version": active.get("version")})
+    return found
+
+
 def docker_contexts():
     """Every configured Docker context, local socket included."""
     try:
@@ -844,12 +922,18 @@ def running_version(image, label_version):
 def image_repo_candidates(container):
     """Repository names this container might correspond to, best first."""
     candidates = []
-    source = container.get("source") or ""
-    if "github.com/" in source:
-        candidates.append(source.split("github.com/", 1)[1].strip("/"))
+    if container.get("source_repo"):
+        return [container["source_repo"]]
 
-    path = container["image"].rsplit(":", 1)[0] if ":" in container["image"].rsplit("/", 1)[-1] \
-        else container["image"]
+    source = container.get("source") or ""
+    repo = repo_from_url(source)
+    if repo:
+        candidates.append(repo)
+
+    image = container.get("image")
+    if not image:
+        return candidates
+    path = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
     parts = [p for p in path.split("/") if p]
     # Drop a registry host, which always carries a dot or a port.
     if parts and ("." in parts[0] or ":" in parts[0]):
@@ -874,7 +958,9 @@ def match_containers(repos, containers, pins):
     unmatched = []
 
     for container in containers:
-        pinned = pins.get(container["image"].rsplit(":", 1)[0]) or pins.get(container["name"])
+        image = container.get("image", "")
+        pinned = pins.get(image.rsplit(":", 1)[0]) if image else None
+        pinned = pinned or pins.get(container["name"])
         if pinned in by_repo:
             by_repo[pinned].append(container)
             continue
@@ -914,12 +1000,8 @@ def compare_versions(released, running):
     return "current"
 
 
-def cmd_containers(args):
+def cmd_installed(args):
     contexts = args.host or [c for c in docker_contexts() if c != "default"]
-    if not contexts:
-        print("No Docker contexts configured.", file=sys.stderr)
-        return 1
-
     state = load_state()
     released = {entry["repo"]: entry for entry in state.get("repos", [])}
     entries = load_repo_entries()
@@ -930,6 +1012,10 @@ def cmd_containers(args):
                 pins[flag[1:]] = repo
 
     containers, problems = [], []
+    if not args.remote_only:
+        containers.extend(pacman_packages())
+        containers.extend(mise_tools())
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(containers_on, ctx, args.timeout): ctx for ctx in contexts}
         for future in concurrent.futures.as_completed(futures):
@@ -940,6 +1026,9 @@ def cmd_containers(args):
                 containers.extend(found)
 
     by_repo, unmatched = match_containers(list(released), containers, pins)
+    # Every package on the machine reporting itself as untracked would bury
+    # the answer, so only containers are suggested for tracking.
+    unmatched = [c for c in unmatched if c["host"] != "local"]
 
     rows = []
     for repo, running in by_repo.items():
@@ -950,8 +1039,8 @@ def cmd_containers(args):
     if args.json:
         print(json.dumps({
             "rows": [
-                {"repo": r, "released": t, "host": c["host"], "container": c["name"],
-                 "running": c["version"], "state": s}
+                {"repo": r, "released": t, "host": c["host"], "name": c["name"],
+                 "via": c.get("via", "docker"), "installed": c["version"], "state": s}
                 for r, t, c, s in rows
             ],
             "unmatched": unmatched,
@@ -962,13 +1051,14 @@ def cmd_containers(args):
     if rows:
         marks = {"behind": "▲ behind", "current": "✓ current", "ahead": "▲ ahead",
                  "differs": "? differs", "unknown": "? unknown"}
-        print("  Tracked repositories you are running\n")
-        for repo, tag, container, verdict in sorted(rows):
+        print("  Tracked repositories you have installed\n")
+        for repo, tag, container, verdict in sorted(rows, key=lambda r: (r[3] != "behind", r[0])):
             running = container["version"] or "unknown"
-            print(f"  {repo:34} released {str(tag):18} running {running:14} "
-                  f"{container['host']:10} {marks[verdict]}")
+            where = container["host"] if container["host"] != "local" else container.get("via", "local")
+            print(f"  {repo:34} released {str(tag):18} installed {running:14} "
+                  f"{where:10} {marks[verdict]}")
     else:
-        print("  None of the tracked repositories are running on these hosts.")
+        print("  None of the tracked repositories are installed here or on those hosts.")
 
     if unmatched:
         print("\n  Running but not tracked\n")
@@ -1125,13 +1215,16 @@ def main():
     mute.add_argument("--unmute", action="store_true")
     mute.set_defaults(func=cmd_mute)
 
-    containers = sub.add_parser(
-        "containers", help="compare releases against what is running on your Docker hosts"
+    installed = sub.add_parser(
+        "installed",
+        aliases=["containers"],
+        help="compare releases against what is installed here and on your Docker hosts",
     )
-    containers.add_argument("host", nargs="*", help="Docker contexts (default: all but `default`)")
-    containers.add_argument("--timeout", type=int, default=25)
-    containers.add_argument("--json", action="store_true")
-    containers.set_defaults(func=cmd_containers)
+    installed.add_argument("host", nargs="*", help="Docker contexts (default: all but `default`)")
+    installed.add_argument("--timeout", type=int, default=25)
+    installed.add_argument("--remote-only", action="store_true", help="skip pacman and mise")
+    installed.add_argument("--json", action="store_true")
+    installed.set_defaults(func=cmd_installed)
 
     status = sub.add_parser("status", help="poll cost, search budget, authentication")
     status.set_defaults(func=cmd_status)
