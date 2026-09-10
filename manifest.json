@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.irhop.github-monitor",
+  "name": "GitHub Release Monitor",
+  "version": "0.1.0",
+  "author": "irhop",
+  "license": "MIT",
+  "description": "Watches the projects you depend on and tells you when one ships \u2014 or when one has gone quiet for longer than it usually does.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GitHub Releases",
+    "description": "New releases from the repositories you track, and a warning for any that are past their own release cadence. Needs no GitHub account.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "newWindowHours": 24,
+      "overdueFactor": 1.5,
+      "showOverdue": true,
+      "showCount": true,
+      "notify": true,
+      "includePrereleases": false,
+      "icon": "\uf09b"
+    },
+    "schema": [
+      {
+        "key": "newWindowHours",
+        "type": "integer",
+        "label": "New for (hours)",
+        "description": "How long a release keeps its dot after it lands",
+        "min": 1,
+        "max": 168,
+        "step": 1,
+        "defaultValue": 24
+      },
+      {
+        "key": "overdueFactor",
+        "type": "number",
+        "label": "Overdue after",
+        "description": "Multiples of a repository's own average gap between releases before it counts as overdue. 1.5 means half again as long as usual.",
+        "min": 1,
+        "max": 5,
+        "step": 0.1,
+        "defaultValue": 1.5
+      },
+      {
+        "key": "showOverdue",
+        "type": "boolean",
+        "label": "Show the overdue warning",
+        "defaultValue": true
+      },
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show the number",
+        "description": "Turn off for an icon that only lights up when something ships",
+        "defaultValue": true
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify on a new release",
+        "defaultValue": true
+      },
+      {
+        "key": "includePrereleases",
+        "type": "boolean",
+        "label": "Count prereleases",
+        "description": "Treat -rc, -beta and -alpha tags as releases",
+        "defaultValue": false
+      }
+    ]
+  }
+}
