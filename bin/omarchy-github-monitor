@@ -684,6 +684,234 @@ def cmd_search(args):
     return 0
 
 
+# ---------------------------------------------------------------- containers
+
+
+VERSION_TAG = re.compile(r"^v?\d+(\.\d+)*([.-][A-Za-z0-9.]+)?$")
+NUMERIC_VERSION = re.compile(r"(\d+(?:\.\d+)*)")
+
+
+def docker_contexts():
+    """Every configured Docker context, local socket included."""
+    try:
+        result = subprocess.run(
+            ["docker", "context", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def containers_on(context, timeout=25):
+    """Running containers on one host, as dicts.
+
+    A host is reached over whatever the context says — for a Tailscale SSH
+    endpoint that can mean an interactive check, which would hang forever in a
+    non-interactive run. Hence the timeout, and hence this being a command you
+    run rather than something on a timer.
+    """
+    # inspect's fields are not ps's: the container name is .Name (with a
+    # leading slash) and the image reference is .Config.Image.
+    template = (
+        "{{.Name}}\t{{.Config.Image}}"
+        "\t{{index .Config.Labels \"org.opencontainers.image.version\"}}"
+        "\t{{index .Config.Labels \"org.opencontainers.image.source\"}}"
+    )
+    try:
+        listed = subprocess.run(
+            ["docker", "--context", context, "ps", "--format", "{{.ID}}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if listed.returncode != 0:
+            return None, (listed.stderr.strip().splitlines() or ["unreachable"])[-1]
+        ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+        if not ids:
+            return [], None
+        inspected = subprocess.run(
+            ["docker", "--context", context, "inspect", "--format", template] + ids,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout}s (Tailscale SSH check?)"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+
+    found = []
+    for line in inspected.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, image, label_version, source = parts[0].lstrip("/"), parts[1], parts[2], parts[3]
+        found.append(
+            {
+                "host": context,
+                "name": name,
+                "image": image,
+                "version": running_version(image, label_version),
+                "source": source if source not in ("", "<no value>") else None,
+            }
+        )
+    return found, None
+
+
+def running_version(image, label_version):
+    """What is actually running, or None when the image will not say.
+
+    A label is authoritative. Failing that a tag like 1.27.2 is a version,
+    while `latest` and `stable` are pointers that reveal nothing.
+    """
+    if label_version and label_version != "<no value>":
+        return label_version
+    tag = image.rsplit(":", 1)[1] if ":" in image.rsplit("/", 1)[-1] else ""
+    return tag if VERSION_TAG.match(tag) else None
+
+
+def image_repo_candidates(container):
+    """Repository names this container might correspond to, best first."""
+    candidates = []
+    source = container.get("source") or ""
+    if "github.com/" in source:
+        candidates.append(source.split("github.com/", 1)[1].strip("/"))
+
+    path = container["image"].rsplit(":", 1)[0] if ":" in container["image"].rsplit("/", 1)[-1] \
+        else container["image"]
+    parts = [p for p in path.split("/") if p]
+    # Drop a registry host, which always carries a dot or a port.
+    if parts and ("." in parts[0] or ":" in parts[0]):
+        parts = parts[1:]
+    if len(parts) >= 2:
+        candidates.append("/".join(parts[-2:]))
+    return candidates
+
+
+def match_containers(repos, containers, pins):
+    """Map each tracked repository to the containers running it.
+
+    Two passes, most trustworthy first: an explicit pin, then the OCI source
+    label and the image path.
+
+    There is deliberately no fuzzy pass on the project name. Matching on the
+    last path segment paired `vaultwarden/server` with `nextcloud/server` and
+    reported a service that is not running at all as out of date. A missed
+    match costs a line in repos.txt; a wrong one costs trust in every row.
+    """
+    by_repo = {repo: [] for repo in repos}
+    unmatched = []
+
+    for container in containers:
+        pinned = pins.get(container["image"].rsplit(":", 1)[0]) or pins.get(container["name"])
+        if pinned in by_repo:
+            by_repo[pinned].append(container)
+            continue
+
+        for candidate in image_repo_candidates(container):
+            if candidate in by_repo:
+                by_repo[candidate].append(container)
+                break
+        else:
+            unmatched.append(container)
+
+    return by_repo, unmatched
+
+
+def normalize_version(value):
+    """A comparable version, or None. Strips a leading v and a `name@` prefix."""
+    if not value:
+        return None
+    value = value.split("@")[-1].lstrip("vV")
+    match = NUMERIC_VERSION.match(value)
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def compare_versions(released, running):
+    """'current', 'behind', 'ahead' or 'differs' — never a guess dressed as fact."""
+    if not released or not running:
+        return "unknown"
+    if released.lstrip("vV").split("@")[-1] == running.lstrip("vV"):
+        return "current"
+    left, right = normalize_version(released), normalize_version(running)
+    if left is None or right is None:
+        return "differs"
+    if right < left:
+        return "behind"
+    if right > left:
+        return "ahead"
+    return "current"
+
+
+def cmd_containers(args):
+    contexts = args.host or [c for c in docker_contexts() if c != "default"]
+    if not contexts:
+        print("No Docker contexts configured.", file=sys.stderr)
+        return 1
+
+    state = load_state()
+    released = {entry["repo"]: entry for entry in state.get("repos", [])}
+    entries = load_repo_entries()
+    pins = {}
+    for repo, flags in entries:
+        for flag in flags:
+            if flag.startswith("@"):
+                pins[flag[1:]] = repo
+
+    containers, problems = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(containers_on, ctx, args.timeout): ctx for ctx in contexts}
+        for future in concurrent.futures.as_completed(futures):
+            found, error = future.result()
+            if error:
+                problems.append((futures[future], error))
+            else:
+                containers.extend(found)
+
+    by_repo, unmatched = match_containers(list(released), containers, pins)
+
+    rows = []
+    for repo, running in by_repo.items():
+        for container in running:
+            tag = released.get(repo, {}).get("tag")
+            rows.append((repo, tag, container, compare_versions(tag, container["version"])))
+
+    if args.json:
+        print(json.dumps({
+            "rows": [
+                {"repo": r, "released": t, "host": c["host"], "container": c["name"],
+                 "running": c["version"], "state": s}
+                for r, t, c, s in rows
+            ],
+            "unmatched": unmatched,
+            "problems": [{"host": h, "error": e} for h, e in problems],
+        }, indent=2))
+        return 0
+
+    if rows:
+        marks = {"behind": "▲ behind", "current": "✓ current", "ahead": "▲ ahead",
+                 "differs": "? differs", "unknown": "? unknown"}
+        print("  Tracked repositories you are running\n")
+        for repo, tag, container, verdict in sorted(rows):
+            running = container["version"] or "unknown"
+            print(f"  {repo:34} released {str(tag):18} running {running:14} "
+                  f"{container['host']:10} {marks[verdict]}")
+    else:
+        print("  None of the tracked repositories are running on these hosts.")
+
+    if unmatched:
+        print("\n  Running but not tracked\n")
+        for container in sorted(unmatched, key=lambda c: (c["host"], c["name"])):
+            suggestion = (image_repo_candidates(container) or [""])[0]
+            print(f"  {container['name']:24} {container['image']:44} {container['host']:10} "
+                  + (f"add {suggestion}" if suggestion else ""))
+
+    for host, error in problems:
+        print(f"\n  {host}: {error}", file=sys.stderr)
+
+    if any(verdict == "unknown" for _, _, _, verdict in rows):
+        print("\n  'unknown' means the image publishes no version: a `latest` tag with no")
+        print("  org.opencontainers.image.version label cannot say what it is running.")
+    return 0
+
+
 def cmd_seen(args):
     """Clear the unseen mark. The panel calls this when you close it."""
     state = load_state()
@@ -806,6 +1034,14 @@ def main():
     mute.add_argument("repo")
     mute.add_argument("--unmute", action="store_true")
     mute.set_defaults(func=cmd_mute)
+
+    containers = sub.add_parser(
+        "containers", help="compare releases against what is running on your Docker hosts"
+    )
+    containers.add_argument("host", nargs="*", help="Docker contexts (default: all but `default`)")
+    containers.add_argument("--timeout", type=int, default=25)
+    containers.add_argument("--json", action="store_true")
+    containers.set_defaults(func=cmd_containers)
 
     status = sub.add_parser("status", help="poll cost, search budget, authentication")
     status.set_defaults(func=cmd_status)

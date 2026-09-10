@@ -108,6 +108,44 @@ becoming a row that is empty for reasons nobody remembers.
 ten requests a minute, unauthenticated — so it runs when you press Enter, not
 as you type. GitHub's qualifiers work: `topic:selfhosted stars:>1000`.
 
+## What are you actually running?
+
+A release matters when you are behind it, not when it exists.
+
+```bash
+omarchy-github-monitor containers            # all Docker contexts
+omarchy-github-monitor containers asgard     # one host
+```
+
+```
+  Tracked repositories you are running
+
+  jellyfin/jellyfin      released v12.0    running 10.11.11    asgard    ▲ behind
+
+  Running but not tracked
+
+  vaultwarden    vaultwarden/server:latest    heimdall    add dani-garcia/vaultwarden
+```
+
+It reads `docker context ls`, so any host you already reach with the Docker
+CLI works. Deliberately a command you run rather than part of the poll: a
+context on a Tailscale SSH endpoint can block on an interactive check, and a
+timer that stalls on a browser prompt nobody sees is worse than no feature.
+Every host call carries a timeout and an unreachable host says so.
+
+**Matching** is the OCI `org.opencontainers.image.source` label first, then
+the image path. There is no fuzzy match on the project name — that paired
+`vaultwarden/server` with `nextcloud/server` and reported a service that was
+not running at all as out of date. When neither works, pin it in `repos.txt`:
+
+```
+dani-garcia/vaultwarden @vaultwarden/server
+```
+
+**Versions** come from the `org.opencontainers.image.version` label, or a tag
+that looks like a version. A `latest` tag with no label reports `unknown` —
+never `current`, because a pointer tag cannot tell you what it points at.
+
 ## Keybindings
 
 Omarchy has no free `SUPER + G` (window grouping) or `SUPER + SHIFT + G`

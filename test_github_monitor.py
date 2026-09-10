@@ -286,3 +286,57 @@ with tempfile.TemporaryDirectory() as tmp:
     assert ghmon.muted_repos() == {"a/one"}
 
 print("mute and flags covered")
+
+
+# ---- container matching
+#
+# The generic-name trap: heimdall runs vaultwarden/server, and matching on the
+# last path segment reported nextcloud/server — a service not running at all —
+# as out of date.
+
+vaultwarden = {"host": "heimdall", "name": "vaultwarden",
+               "image": "vaultwarden/server:latest", "version": "1.37.0", "source": None}
+jellyfin = {"host": "asgard", "name": "jellyfin_asgard",
+            "image": "jellyfin/jellyfin:latest", "version": "10.11.11", "source": None}
+
+by_repo, unmatched = ghmon.match_containers(
+    ["nextcloud/server", "jellyfin/jellyfin"], [vaultwarden, jellyfin], {}
+)
+assert by_repo["nextcloud/server"] == [], by_repo
+assert by_repo["jellyfin/jellyfin"] == [jellyfin]
+assert unmatched == [vaultwarden]
+
+# A pin rescues what the automatic passes cannot see.
+by_repo, unmatched = ghmon.match_containers(
+    ["dani-garcia/vaultwarden"], [vaultwarden], {"vaultwarden/server": "dani-garcia/vaultwarden"}
+)
+assert by_repo["dani-garcia/vaultwarden"] == [vaultwarden]
+assert unmatched == []
+
+# The OCI source label outranks the image path.
+labelled = {"host": "asgard", "name": "oikos", "image": "ghcr.io/other/name:latest",
+            "version": "2.6.0", "source": "https://github.com/ulsklyc/yuvomi"}
+by_repo, _ = ghmon.match_containers(["ulsklyc/yuvomi"], [labelled], {})
+assert by_repo["ulsklyc/yuvomi"] == [labelled]
+
+# A registry host is not an owner.
+assert ghmon.image_repo_candidates(
+    {"image": "ghcr.io/blakeblackshear/frigate:stable", "source": None}
+) == ["blakeblackshear/frigate"]
+
+# ---- version extraction and comparison
+assert ghmon.running_version("gitea/gitea:1.27.2", "") == "1.27.2"
+assert ghmon.running_version("jellyfin/jellyfin:latest", "10.11.11") == "10.11.11"
+assert ghmon.running_version("ghcr.io/x/frigate:stable", "") is None
+assert ghmon.running_version("x/y:latest", "<no value>") is None
+
+assert ghmon.compare_versions("v10.11.11", "10.11.11") == "current"
+assert ghmon.compare_versions("v12.0", "10.11.11") == "behind"
+assert ghmon.compare_versions("v1.0.0", "1.2.0") == "ahead"
+assert ghmon.compare_versions("n8n@2.39.2", "2.39.2") == "current"
+# An unknown running version must never be reported as up to date.
+assert ghmon.compare_versions("v12.0", None) == "unknown"
+assert ghmon.compare_versions(None, "1.0") == "unknown"
+assert ghmon.compare_versions("stable-2026", "weekly-9") == "differs"
+
+print("container matching covered")
