@@ -306,3 +306,40 @@ Phase 1 stands alone. Each later phase is usable without the ones after it.
 - Issues, pull requests, stars, CI status. `gh-dash` covers those.
 - Repositories outside github.com.
 - Syncing tracked repositories between machines.
+
+
+## What shipped differently
+
+Recorded rather than rewritten, so the reasoning above stays readable next to
+what the code actually does.
+
+**The dot means unseen, not recent.** `newWindowHours` is gone. A release you
+have looked at stops being news, so the mark clears when the panel closes
+rather than when a timer expires.
+
+**`pollMinutes` is gone.** The systemd timer owns the interval; a setting that
+claimed to change it would have been a lie, since nothing regenerated the unit.
+Staleness is now a fixed hour without a successful poll, published by the
+daemon as `stale_after_seconds`.
+
+**Settings come from `shell.json`.** The design said `manifest.json` schema,
+which is right for declaring them, but the values live inline in the widget's
+bar layout entry. Reading anywhere else — as the first implementation did —
+means the settings UI appears to work and changes nothing.
+
+**Derived fields are recomputed every poll.** A feed answering `304` returns
+the stored entry, so ages and overdue state are computed from the timestamp on
+every run. The first version carried them forward, which froze an age at
+whatever it said when the feed last changed.
+
+**Token enrichment is not implemented.** Commits-since-tag and exact
+prerelease flags remain unbuilt, so nothing claims them. A token, when one is
+present, raises the search allowance from ten requests a minute to thirty.
+
+**Overdue muting, per repository.** Not in the original design. Some projects
+ship in bursts and will never look regular; without a way to silence those the
+badge stops meaning anything.
+
+**Container comparison is a command, not part of the poll.** A Docker context
+on a Tailscale SSH endpoint can block on an interactive check, which a timer
+would hit unattended.

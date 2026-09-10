@@ -5,8 +5,8 @@ Polling reads each repository's releases.atom feed, which costs nothing against
 the REST API's 60/hour unauthenticated budget and needs no token. The daemon
 writes a JSON state file; the bar widget reads it and nothing else.
 
-A token is used when one happens to be present, for two enrichment fields, and
-is never asked for or stored. See docs/design.md.
+A token is used when one happens to be present, to raise the search allowance,
+and is never asked for or stored. Polling never needs one. See docs/design.md.
 """
 
 import argparse
@@ -28,7 +28,8 @@ from pathlib import Path
 
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 FEED_URL = "https://github.com/{repo}/releases.atom"
-SEARCH_URL = "https://api.github.com/search/repositories"
+GITHUB_API = "https://api.github.com"
+SEARCH_URL = GITHUB_API + "/search/repositories"
 USER_AGENT = "omarchy-github-monitor (+https://github.com/irhop)"
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy-github-monitor"
@@ -41,7 +42,7 @@ TAG_FROM_ID = re.compile(r"/([^/]+)$")
 # Matches a prerelease marker whether it is separated (v1.2.0-rc.1) or run
 # straight onto the version, which nextcloud does (v35.0.0rc4).
 PRERELEASE_TAG = re.compile(
-    r"(?:[-._]|\d)(?:rc|alpha|beta|pre|preview|next|canary|snapshot)[-._]?\d*\b", re.I
+    r"(?:[-._]|\d)(?:rc|alpha|beta|pre|preview|dev|next|canary|snapshot)[-._]?\d*\b", re.I
 )
 # Tags that name a moving target rather than a release. GitHub lists them in
 # the feed every time they are re-pointed, which makes a project look like it
@@ -56,15 +57,25 @@ DOCTYPE = re.compile(r"<!DOCTYPE", re.I)
 REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 DEFAULTS = {
-    "poll_minutes": 15,
-    "new_window_hours": 24,
     "overdue_factor": 1.5,
     "include_prereleases": False,
     "notify": True,
 }
 
+# A poll every 15 minutes means an hour without one is four missed runs: the
+# timer is off, or every feed is failing. Either way the number in the bar can
+# no longer be trusted, and saying so beats showing a figure that has quietly
+# stopped moving.
+STALE_AFTER_SECONDS = 3600
+
 # A cadence needs enough releases to be a cadence rather than a coincidence.
 MIN_RELEASES_FOR_CADENCE = 3
+
+# A project that ships several times a day is never "overdue" — an hour's gap
+# is not news, and at a 1.5x factor nextcloud/server earned a warning sixty
+# minutes after releasing. Overdue is about projects that have gone quiet, so
+# it needs a rhythm measured in days.
+MIN_CADENCE_DAYS = 1.0
 
 # Bumped whenever parsing or computation changes. Cached entries are reused on
 # an HTTP 304, so without this a logic fix would never reach rows whose feeds
@@ -207,10 +218,6 @@ def save_repo_entries(entries):
     write_atomic(REPO_FILE, header + "\n".join(lines) + "\n")
 
 
-def save_repos(repos):
-    save_repo_entries([(repo, set()) for repo in repos])
-
-
 def normalize_repo(value):
     """Accept owner/repo, or a github.com URL pointing at one.
 
@@ -250,9 +257,42 @@ def write_atomic(path, text):
     os.replace(tmp, path)
 
 
-def settings(state):
+SHELL_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy/shell.json"
+PLUGIN_ID = "io.github.irhop.github-monitor"
+
+# manifest.json key -> the name this module uses.
+SETTING_KEYS = {
+    "overdueFactor": "overdue_factor",
+    "notify": "notify",
+    "includePrereleases": "include_prereleases",
+}
+
+
+def widget_settings():
+    """What the bar's settings UI actually writes.
+
+    The shell stores a widget's settings inline in its shell.json layout
+    entry, so that file is the source of truth. Reading anywhere else means
+    the settings UI appears to work and changes nothing.
+    """
+    try:
+        config = json.loads(SHELL_CONFIG.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    layout = (config.get("bar") or {}).get("layout") or {}
+    for section in ("left", "center", "right"):
+        for entry in layout.get(section) or []:
+            if entry.get("id") == PLUGIN_ID:
+                return {
+                    name: entry[key] for key, name in SETTING_KEYS.items() if key in entry
+                }
+    return {}
+
+
+def settings(state=None):
     merged = dict(DEFAULTS)
-    merged.update(state.get("settings") or {})
+    merged.update(widget_settings())
     return merged
 
 
@@ -379,9 +419,37 @@ def is_overdue(days_since, avg_days, release_count, factor):
     two releases can be a coincidence, so require MIN_RELEASES_FOR_CADENCE."""
     if avg_days is None or days_since is None:
         return False
-    if release_count < MIN_RELEASES_FOR_CADENCE or avg_days <= 0:
+    if release_count < MIN_RELEASES_FOR_CADENCE or avg_days < MIN_CADENCE_DAYS:
         return False
     return days_since > factor * avg_days
+
+
+def apply_derived(entry, opts, muted, now):
+    """Recompute everything that depends on the clock or on settings.
+
+    Run for every repository on every poll, including ones whose feed answered
+    304. Those return the stored entry untouched, so without this an age would
+    freeze at whatever it said when the feed last changed, and a changed
+    overdue factor would never reach a repository that had not released since.
+    """
+    published = parse_iso8601(entry.get("published_at"))
+    if published:
+        days_since = (now - published).total_seconds() / 86400.0
+        entry["days_since_release"] = round(days_since, 2)
+        entry["age"] = human_age(published, now)
+    else:
+        days_since = None
+        entry["days_since_release"] = None
+        entry["age"] = None
+
+    entry["overdue"] = (not muted) and is_overdue(
+        days_since,
+        entry.get("avg_days_between_releases"),
+        entry.get("release_count", 0),
+        opts["overdue_factor"],
+    )
+    entry["overdue_muted"] = muted
+    return entry
 
 
 def summarize(repo, releases, previous, opts, now, muted=False):
@@ -438,8 +506,7 @@ def fetch_repo(repo, previous, opts, now, muted=False):
         return {**(previous or {"repo": repo}), "error": f"unreachable: {exc}"}
 
     if status == 304 and previous:
-        return {**previous, "error": None, "overdue": previous.get("overdue", False) and not muted,
-                "overdue_muted": muted}
+        return {**previous, "error": None}
     if status == 404:
         return {**(previous or {"repo": repo}), "error": "not found or no releases"}
     if status != 200:
@@ -502,7 +569,11 @@ def cmd_fetch(args):
         }
         entries = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
 
-    ordered = [entries[repo] for repo in repos]
+    # Ages and overdue state depend on now and on the current settings, so
+    # they are computed here rather than being whatever the last fetch stored.
+    ordered = [
+        apply_derived(entries[repo], opts, repo in muted, now) for repo in repos
+    ]
 
     # Notify only for tags that differ from the ones already recorded. On a
     # first run there is nothing recorded, and 19 notifications would be a
@@ -520,9 +591,12 @@ def cmd_fetch(args):
             {
                 "generated_at": iso(now),
                 "logic_version": LOGIC_VERSION,
-                "poll_interval_seconds": opts["poll_minutes"] * 60,
+                # No interval here: the systemd timer owns it, and a number
+                # this file invented would be wrong the moment the timer is
+                # edited. Staleness is "no successful poll in a while".
+                "stale_after_seconds": STALE_AFTER_SECONDS,
                 "authenticated": bool(token),
-                "settings": state.get("settings", {}),
+                "settings": widget_settings(),
                 "repos": ordered,
             },
             indent=2,
@@ -531,8 +605,7 @@ def cmd_fetch(args):
 
     failed = [e for e in ordered if e.get("error")]
     if not args.quiet:
-        new = sum(1 for e in ordered if e.get("days_since_release") is not None
-                  and e["days_since_release"] * 24 <= opts["new_window_hours"])
+        new = sum(1 for e in ordered if e.get("unseen"))
         overdue = sum(1 for e in ordered if e.get("overdue"))
         print(f"{len(ordered)} repos, {new} new, {overdue} overdue, {len(failed)} failed")
         for entry in failed:
@@ -541,9 +614,10 @@ def cmd_fetch(args):
 
 
 def cmd_run(args):
+    """Debugging loop. The systemd timer is the real path."""
     while True:
         cmd_fetch(args)
-        time.sleep(settings(load_state())["poll_minutes"] * 60)
+        time.sleep(args.interval * 60)
 
 
 def cmd_list(args):
@@ -948,21 +1022,36 @@ def cmd_status(args):
     generated = parse_iso8601(state.get("generated_at", ""))
     freshness = human_age(generated, now_utc()) if generated else "never run"
 
-    print(f"  {len(repos)} repos, polled every {opts['poll_minutes']}m via releases.atom   0 API requests")
+    print(f"  {len(repos)} repos via releases.atom{'':21}0 API requests")
     print(f"  last poll{'':38}{freshness}")
 
+    timer = "not installed"
     try:
-        status, headers, _ = http_get(f"{SEARCH_URL}?q=omarchy&per_page=1")
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "omarchy-github-monitor.timer"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if active.stdout.strip():
+            timer = active.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    print(f"  poll timer{'':37}{timer}")
+
+    # /rate_limit reports every budget and is not itself rate limited, so
+    # checking the search allowance no longer costs one of its ten requests.
+    try:
+        status, _, body = http_get(f"{GITHUB_API}/rate_limit")
         if status == 200:
-            print(f"  search{'':41}{headers.get('x-ratelimit-limit', '?')}/min, "
-                  f"{headers.get('x-ratelimit-remaining', '?')} left")
-    except (urllib.error.URLError, OSError, TimeoutError):
+            search = json.loads(body).get("resources", {}).get("search", {})
+            print(f"  search{'':41}{search.get('limit', '?')}/min, "
+                  f"{search.get('remaining', '?')} left")
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError):
         print("  search                                         unreachable")
 
     print(f"  authentication{'':33}{source if token else 'none'}")
     if not token:
-        print("\n  Authenticating adds: commits since latest tag, exact prerelease flags")
-        print("  Any of these is picked up automatically:")
+        print("\n  Authenticating raises the search allowance from 10 to 30 per minute.")
+        print("  Polling needs no token at all. Any of these is picked up automatically:")
         print("    gh auth login          (recommended, browser flow, nothing to copy)")
         print("    GITHUB_TOKEN=...       in the environment")
         print("    GH_TOKEN=...")
@@ -1005,6 +1094,7 @@ def main():
 
     run = sub.add_parser("run", help="poll in a loop (debugging; the timer is the real path)")
     run.add_argument("-q", "--quiet", action="store_true")
+    run.add_argument("--interval", type=int, default=15, help="minutes between polls")
     run.set_defaults(func=cmd_run)
 
     listing = sub.add_parser("list", help="show tracked repositories")

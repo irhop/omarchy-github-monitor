@@ -25,7 +25,6 @@ BarWidget {
   readonly property string icon: String(setting("icon", String.fromCodePoint(0xF09B)))
   readonly property bool showOverdue: setting("showOverdue", true) !== false
   readonly property bool showCount: setting("showCount", true) !== false
-  readonly property int newWindowHours: Math.max(1, Number(setting("newWindowHours", 24)) || 24)
 
   // ---- state, straight off the daemon's file
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
@@ -52,15 +51,13 @@ BarWidget {
     return count
   }
 
-  // The timer polls every 15 minutes by default. Nothing for four times that
-  // long means it is not running, and a number that quietly stops moving is
-  // worse than an obvious hint that it has stopped.
+  // The daemon says how long a poll may be missing before its own numbers
+  // stop meaning anything; the widget does not second-guess it.
   readonly property bool stale: {
     if (!state || !state.generated_at) return true
     var generated = Date.parse(state.generated_at)
     if (isNaN(generated)) return true
-    var interval = Number(state.poll_interval_seconds) || 900
-    return (now.getTime() - generated) > interval * 4000
+    return (now.getTime() - generated) > (Number(state.stale_after_seconds) || 3600) * 1000
   }
 
   readonly property bool everRun: state !== null && state !== undefined

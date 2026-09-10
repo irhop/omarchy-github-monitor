@@ -19,7 +19,6 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "newWindowHours": 24,
       "overdueFactor": 1.5,
       "showOverdue": true,
       "showCount": true,
@@ -28,16 +27,6 @@
       "icon": "\uf09b"
     },
     "schema": [
-      {
-        "key": "newWindowHours",
-        "type": "integer",
-        "label": "New for (hours)",
-        "description": "How long a release keeps its dot after it lands",
-        "min": 1,
-        "max": 168,
-        "step": 1,
-        "defaultValue": 24
-      },
       {
         "key": "overdueFactor",
         "type": "number",

@@ -140,9 +140,6 @@ Panel {
 
   readonly property var repos: hostWidget ? hostWidget.repos : []
   readonly property bool stale: hostWidget ? hostWidget.stale : false
-  readonly property bool authenticated: hostWidget && hostWidget.state
-    ? hostWidget.state.authenticated === true : false
-  readonly property int newWindowHours: hostWidget ? hostWidget.newWindowHours : 24
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -584,13 +581,13 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         color: root.dim
-        // A statement of fact, not a request. There is nothing to click and
-        // nothing is broken; two enrichment fields are simply absent.
+        // Nothing about the poll needs a token, so there is nothing to say
+        // when one is absent. The line is for real trouble only.
         text: {
           if (root.toast !== "") return root.toast
           if (root.stale) return "poll has stopped — check omarchy-github-monitor.timer"
           if (root.selected === null && !root.adding) return "click a row for notes · middle click opens GitHub"
-          return root.authenticated ? "" : "unauthenticated — commits since tag unavailable"
+          return ""
         }
       }
 

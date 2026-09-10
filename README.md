@@ -46,8 +46,9 @@ Nineteen repositories take about two seconds, and unchanged feeds answer
 `304 Not Modified`.
 
 If a token happens to be present — `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth
-token` — two extra fields appear: commits since the latest tag, and exact
-prerelease flags. Nothing prompts you for one, and none is ever stored.
+token` — it is used to raise the search allowance from ten requests a minute
+to thirty. Polling never needs one. Nothing prompts you for a token, and none
+is ever stored.
 
 ## The dot means unseen
 

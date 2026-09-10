@@ -340,3 +340,45 @@ assert ghmon.compare_versions(None, "1.0") == "unknown"
 assert ghmon.compare_versions("stable-2026", "weekly-9") == "differs"
 
 print("container matching covered")
+
+
+# ---- derived fields are recomputed, not carried
+#
+# A feed that answers 304 returns the stored entry untouched. Without a
+# recompute its age freezes at whatever it said when the feed last changed,
+# and a changed overdue factor never reaches it.
+
+stored = {
+    "repo": "o/r",
+    "published_at": days_ago(40, NOW),
+    "age": "23h ago",                    # stale: written 39 days earlier
+    "days_since_release": 1.0,
+    "avg_days_between_releases": 10.0,
+    "release_count": 5,
+    "overdue": False,
+}
+
+fresh = ghmon.apply_derived(dict(stored), {"overdue_factor": 1.5}, False, NOW)
+assert fresh["age"] == "40d ago", fresh["age"]
+assert fresh["days_since_release"] == 40.0
+assert fresh["overdue"] is True
+
+# A raised factor must reach a repository that has not released since.
+relaxed = ghmon.apply_derived(dict(stored), {"overdue_factor": 6.0}, False, NOW)
+assert relaxed["overdue"] is False, "overdue factor must apply to cached entries"
+
+# Muting still wins over any factor.
+muted_entry = ghmon.apply_derived(dict(stored), {"overdue_factor": 1.5}, True, NOW)
+assert muted_entry["overdue"] is False
+assert muted_entry["overdue_muted"] is True
+
+print("derived recomputation covered")
+
+
+# A project that ships several times a day is never overdue: nextcloud/server
+# earned a warning one hour after releasing, which is not news about anything.
+assert ghmon.is_overdue(0.05, 0.02, 10, 1.5) is False
+assert ghmon.is_overdue(30, 0.5, 10, 1.5) is False       # twice a day, gone quiet a month
+assert ghmon.is_overdue(30, ghmon.MIN_CADENCE_DAYS, 10, 1.5) is True
+
+print("cadence floor covered")
