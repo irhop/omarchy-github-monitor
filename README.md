@@ -123,13 +123,36 @@ tracked and still reports releases; it just never warns.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/irhop/omarchy-github-monitor.git --enable
-~/.config/omarchy/plugins/io.github.irhop.github-monitor/bin/omarchy-github-monitor bootstrap
+omarchy plugin add https://github.com/irhop/omarchy-github-monitor.git
 ```
 
-Enabling the plugin installs nothing on its own — you get a widget that reads
-a file. `bootstrap` is what installs the systemd user timer that writes that
-file, and `bootstrap --dry-run` shows exactly what it would do first.
+It lands disabled, which is the point: plugins run unsandboxed inside
+`omarchy-shell`, so read the code before enabling anything. When you are
+satisfied:
+
+```bash
+~/.config/omarchy/plugins/io.github.irhop.github-monitor/install.sh
+```
+
+That enables the widget and installs the poll timer. Enabling the plugin on
+its own installs nothing — you get a widget that reads a file. To see exactly
+what the timer setup would do first:
+
+```bash
+~/.config/omarchy/plugins/io.github.irhop.github-monitor/bin/omarchy-github-monitor bootstrap --dry-run
+```
+
+## What it runs
+
+Plugins are unsandboxed, so here is the whole list of what this one executes
+and touches. Nothing here needs root.
+
+| | |
+| --- | --- |
+| network | `https://github.com/OWNER/REPO/releases.atom` for tracked repositories; `api.github.com` only when you search or ask for `status` |
+| writes | `~/.config/omarchy-github-monitor/repos.txt`, `~/.local/state/omarchy-github-monitor/state.json`, and its own entry in `~/.config/omarchy/shell.json` |
+| runs | `wl-copy` (copy buttons), `xdg-open` (open on GitHub), `omarchy-notification-send`, `systemctl --user` (timer setup only), and for `installed`: `pacman -Qi`, `mise`, `docker` |
+| never | asks for, stores, or transmits a GitHub token; a token in your environment is used only to raise the search allowance |
 
 ## Tracked repositories
 
