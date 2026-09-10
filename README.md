@@ -1,5 +1,7 @@
 # GitHub Release Monitor
 
+![The widget and its release list](preview.png)
+
 An Omarchy bar widget that watches the projects you depend on and tells you
 when one ships — or when one has gone quiet for longer than it usually does.
 
@@ -156,7 +158,7 @@ A release matters when you are behind it, not when it exists.
 
 ```bash
 omarchy-github-monitor installed             # this machine and every Docker context
-omarchy-github-monitor installed asgard      # one host
+omarchy-github-monitor installed homelab     # one host
 omarchy-github-monitor installed --remote-only
 ```
 
@@ -165,11 +167,11 @@ omarchy-github-monitor installed --remote-only
 
   anomalyco/opencode   released v1.18.30   installed 1.18.25    mise      ▲ behind
   atuinsh/atuin        released v18.22.0   installed 18.21.0    pacman    ▲ behind
-  jellyfin/jellyfin    released v12.0      installed 10.11.11   asgard    ▲ behind
+  jellyfin/jellyfin    released v12.0      installed 10.11.11   homelab   ▲ behind
 
   Running but not tracked
 
-  vaultwarden    vaultwarden/server:latest    heimdall    add dani-garcia/vaultwarden
+  vaultwarden    vaultwarden/server:latest    homelab   add dani-garcia/vaultwarden
 ```
 
 Rows that are behind come first. Three sources, none of them guessing at
@@ -185,7 +187,7 @@ among them. If you have no contexts yet, one line adds a server you can
 already SSH into:
 
 ```bash
-docker context create asgard --docker host=ssh://root@asgard
+docker context create homelab --docker host=ssh://you@homelab
 omarchy-github-monitor installed
 ```
 
