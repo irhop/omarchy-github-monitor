@@ -186,6 +186,50 @@ Panel {
     Quickshell.execDetached(["xdg-open", url])
   }
 
+  function repoUrl(entry) {
+    return entry ? "https://github.com/" + entry.repo : ""
+  }
+
+  // The release page when the feed gave one, the releases index otherwise —
+  // a row whose feed errored still has somewhere sensible to go.
+  function releaseUrl(entry) {
+    if (!entry) return ""
+    return entry.url ? entry.url : repoUrl(entry) + "/releases"
+  }
+
+  function copyToClipboard(value, description) {
+    if (!value) return
+    copyProcess.command = ["wl-copy", "--", value]
+    copyProcess.running = true
+    toast = "Copied " + description
+    toastTimer.restart()
+  }
+
+  // Confirmation for a copy, which is otherwise invisible.
+  property string toast: ""
+
+  Timer {
+    id: toastTimer
+    interval: 2500
+    onTriggered: root.toast = ""
+  }
+
+  Process {
+    id: copyProcess
+    clearEnvironment: true
+    // wl-copy talks to the compositor, so it needs the display socket the
+    // daemon environment deliberately drops.
+    environment: {
+      var env = root.monitorEnvironment()
+      var keep = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"]
+      for (var i = 0; i < keep.length; i++) {
+        var value = Quickshell.env(keep[i])
+        if (value) env[keep[i]] = value
+      }
+      return env
+    }
+  }
+
   onOpenedChanged: if (!opened) { selectedRepo = ""; closeAdd() }
 
   KeyboardPanel {
@@ -342,12 +386,47 @@ Panel {
             width: parent.width
             spacing: Style.space(6)
 
-            Text {
-              textFormat: Text.PlainText
-              text: (root.selected.tag || "") + "  ·  " + (root.selected.age || "")
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              color: root.foreground
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                text: (root.selected.tag || "") + "  ·  " + (root.selected.age || "")
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                color: root.foreground
+              }
+
+              PanelActionButton {
+                iconText: "\uf0c1"
+                tooltipText: "Open the release on GitHub"
+                foreground: root.foreground
+                onClicked: root.openInBrowser(root.releaseUrl(root.selected))
+              }
+
+              PanelActionButton {
+                iconText: "\uf09b"
+                tooltipText: "Open the repository on GitHub"
+                foreground: root.foreground
+                onClicked: root.openInBrowser(root.repoUrl(root.selected))
+              }
+
+              PanelActionButton {
+                iconText: "\uf0c5"
+                tooltipText: "Copy the tag"
+                foreground: root.foreground
+                onClicked: root.copyToClipboard(root.selected.tag, "tag " + root.selected.tag)
+              }
+
+              PanelActionButton {
+                iconText: "\uf0ac"
+                tooltipText: "Copy the release link"
+                foreground: root.foreground
+                onClicked: root.copyToClipboard(root.releaseUrl(root.selected), "release link")
+              }
             }
 
             Text {
@@ -460,9 +539,12 @@ Panel {
         color: root.dim
         // A statement of fact, not a request. There is nothing to click and
         // nothing is broken; two enrichment fields are simply absent.
-        text: root.stale
-          ? "poll has stopped — check omarchy-github-monitor.timer"
-          : (root.authenticated ? "" : "unauthenticated — commits since tag unavailable")
+        text: {
+          if (root.toast !== "") return root.toast
+          if (root.stale) return "poll has stopped — check omarchy-github-monitor.timer"
+          if (root.selected === null && !root.adding) return "click a row for notes · middle click opens GitHub"
+          return root.authenticated ? "" : "unauthenticated — commits since tag unavailable"
+        }
       }
 
       // PanelActionButton is icon-only, which suits a footer that should not

@@ -11,6 +11,32 @@ when one ships — or when one has gone quiet for longer than it usually does.
 
 Click for the list and the release notes. Middle click polls now.
 
+## What clicks do
+
+In the bar:
+
+| | |
+| --- | --- |
+| left click | open the list |
+| middle click | poll the feeds now |
+
+In the list:
+
+| | |
+| --- | --- |
+| left click | release notes for that repository |
+| middle click | open the release on GitHub |
+| right click | copy the release link |
+
+In the notes view, four buttons: open the release, open the repository, copy
+the tag, copy the release link.
+
+There is deliberately no "copy the install command". A release feed says what
+shipped, not how a project is installed — immich is a compose file, atuin a
+shell script, syncthing a distro package. A guessed command would look
+authoritative and be wrong. The tag and the links are what the feed actually
+knows.
+
 ## No GitHub account required
 
 Polling reads each repository's `releases.atom` feed, which is the web

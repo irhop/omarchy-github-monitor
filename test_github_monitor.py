@@ -234,3 +234,18 @@ for tag in ("v1.2.3", "160", "n8n@2.39.2", "2026.09.1"):
     assert ghmon.is_prerelease(tag) is False, tag
 
 print("real-feed regressions covered")
+
+
+# A bullet must not be stranded on its own line when the markup wraps.
+assert ghmon.strip_html("<li>\n  one</li><li>\ntwo</li>") == "• one\n• two"
+assert ghmon.strip_html("<ul><li>alpha</li>\n<li>beta</li></ul>") == "• alpha\n• beta"
+
+print("notes formatting covered")
+
+
+# Hard-wrapped notes: a break before a continuation line is joined, a break
+# before a new sentence is kept.
+assert ghmon.strip_html("<p>setting the new</p><p>group attribute.</p>") == "setting the new group attribute."
+assert ghmon.strip_html("<p>First line.</p><p>Second line.</p>") == "First line.\n\nSecond line."
+
+print("hard-wrap joining covered")

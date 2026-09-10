@@ -69,7 +69,7 @@ MIN_RELEASES_FOR_CADENCE = 3
 # Bumped whenever parsing or computation changes. Cached entries are reused on
 # an HTTP 304, so without this a logic fix would never reach rows whose feeds
 # had not changed — they would keep serving results the old code produced.
-LOGIC_VERSION = 2
+LOGIC_VERSION = 4
 
 
 # ---------------------------------------------------------------- basics
@@ -115,10 +115,25 @@ def strip_html(text):
         return ""
     text = re.sub(r"(?is)<(script|style).*?</\1>", "", text)
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", text)
+    # Paragraphs and headings get air; list items and table rows stay tight.
+    text = re.sub(r"(?i)</(p|div|h[1-6])>", "\n\n", text)
+    text = re.sub(r"(?i)</(li|tr)>", "\n", text)
     text = re.sub(r"(?i)<li[^>]*>", "• ", text)
     text = HTML_TAG.sub("", text)
     text = html.unescape(text)
+    # A list item whose markup is followed by a newline would otherwise leave
+    # the bullet stranded on a line of its own.
+    text = re.sub(r"•[ \t]*\n[ \t]*", "• ", text)
+    # List items sit on consecutive lines: the markup's own newline plus the
+    # one this function adds would otherwise double-space every list.
+    text = re.sub(r"\n[ \t]*\n(?=[ \t]*•)", "\n", text)
+    # Hard-wrapped notes arrive as one paragraph per source line, and the
+    # panel wraps the text again, so a break mid-sentence reads as a stray
+    # blank line. A continuation line starts lowercase or with punctuation
+    # that cannot open a sentence.
+    # ponytail: heuristic on the first character; a real sentence splitter
+    # would be a dependency and would still guess.
+    text = re.sub(r"\n[ \t]*\n?[ \t]*(?=[a-z(\[),.;:])", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return "\n".join(line.rstrip() for line in text.split("\n")).strip()
 
