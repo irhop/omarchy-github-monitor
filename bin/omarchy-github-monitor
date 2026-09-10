@@ -1001,7 +1001,10 @@ def compare_versions(released, running):
 
 
 def cmd_installed(args):
-    contexts = args.host or [c for c in docker_contexts() if c != "default"]
+    # `default` is the local Docker socket. Skipping it would hide the
+    # containers on the machine you are sitting at, which for anyone running
+    # their stack locally is every container they have.
+    contexts = args.host or docker_contexts()
     state = load_state()
     released = {entry["repo"]: entry for entry in state.get("repos", [])}
     entries = load_repo_entries()
@@ -1069,6 +1072,11 @@ def cmd_installed(args):
 
     for host, error in problems:
         print(f"\n  {host}: {error}", file=sys.stderr)
+
+    if not contexts and not args.remote_only:
+        print("\n  No Docker contexts found, so only this machine was checked.")
+        print("  Add a host you can reach over SSH:")
+        print("    docker context create myhost --docker host=ssh://user@myhost")
 
     if any(verdict == "unknown" for _, _, _, verdict in rows):
         print("\n  'unknown' means the image publishes no version: a `latest` tag with no")

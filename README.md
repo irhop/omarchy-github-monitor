@@ -134,7 +134,40 @@ omarchy-github-monitor installed --remote-only
 Rows that are behind come first. Three sources, none of them guessing at
 names: `pacman -Qi` reports each package's declared upstream URL, `mise
 registry` maps a tool to its backend repository, and Docker containers carry
-the OCI source label. Every host you already reach with the Docker CLI works. Deliberately a command you run rather than part of the poll: a
+the OCI source label.
+
+### Your own servers
+
+There is no host list to configure. It reads `docker context ls`, so every
+host you already reach with the Docker CLI is included, the local socket
+among them. If you have no contexts yet, one line adds a server you can
+already SSH into:
+
+```bash
+docker context create asgard --docker host=ssh://root@asgard
+omarchy-github-monitor installed
+```
+
+That is the same mechanism `docker --context` uses, so nothing here is
+specific to this plugin and nothing new has to be kept in sync.
+
+A host that needs an interactive check — Tailscale SSH does, by default, on
+every new connection — will hit the timeout and be reported as unreachable
+rather than hanging. Raising `checkPeriod` in the tailnet policy makes those
+hosts answer without a browser round trip.
+
+### When a version cannot be read
+
+`unknown` is not a failure, it is the honest answer for an image whose tag is
+a pointer (`latest`, `stable`) and which publishes no
+`org.opencontainers.image.version` label. It is never reported as `current`.
+
+When the automatic matching cannot connect a container to a repository you
+track, pin it in `repos.txt`:
+
+```
+dani-garcia/vaultwarden @vaultwarden/server
+``` Deliberately a command you run rather than part of the poll: a
 context on a Tailscale SSH endpoint can block on an interactive check, and a
 timer that stalls on a browser prompt nobody sees is worse than no feature.
 Every host call carries a timeout and an unreachable host says so.
