@@ -142,6 +142,41 @@ what the timer setup would do first:
 ~/.config/omarchy/plugins/io.github.irhop.github-monitor/bin/omarchy-github-monitor bootstrap --dry-run
 ```
 
+## Removing it
+
+```bash
+# Stop and remove the poll timer
+systemctl --user disable --now omarchy-github-monitor.timer
+rm -f ~/.config/systemd/user/omarchy-github-monitor.{timer,service}
+systemctl --user daemon-reload
+
+# Take the widget off the bar and delete the plugin
+omarchy plugin remove io.github.irhop.github-monitor
+
+# Your tracked list and poll history, if you want them gone too
+rm -rf ~/.config/omarchy-github-monitor ~/.local/state/omarchy-github-monitor
+```
+
+The plugin's entry in `~/.config/omarchy/shell.json` goes with `omarchy plugin
+remove`. Nothing else on the system is touched, so those four steps remove it
+completely.
+
+## Dependencies
+
+Python 3 and the standard library, and nothing else required — no pip
+packages, no `requests`.
+
+Everything below is optional and only used by the feature named beside it. The
+plugin works without all of them.
+
+| | |
+| --- | --- |
+| `wl-copy` (wl-clipboard) | the copy buttons |
+| `xdg-open` | opening a release in your browser |
+| `omarchy-notification-send` | notifications, falling back to `notify-send` |
+| `systemd` (user session) | the poll timer |
+| `pacman`, `mise`, `docker` | `installed`, each used only if present |
+
 ## What it runs
 
 Plugins are unsandboxed, so here is the whole list of what this one executes
