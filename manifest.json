@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.irhop.github-monitor",
   "name": "GitHub Release Monitor",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "author": "irhop",
   "license": "MIT",
   "description": "Watches the projects you depend on and tells you when one ships \u2014 or when one has gone quiet for longer than it usually does.",

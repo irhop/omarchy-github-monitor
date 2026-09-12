@@ -195,12 +195,24 @@ and touches. Nothing here needs root.
 None of them is looked up on `PATH`. Each is resolved once against a fixed list
 of directories — `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/share/omarchy/bin`
 — and called by absolute path afterwards. Being on that list is not enough on
-its own: both the resolved file and the directory holding it must be owned by
-`root` and unwritable by anyone else, so a symlink pointing somewhere you can
-write is refused rather than executed. Nothing your own account can modify is
-ever run, which is also why no command is consulted for a GitHub token. A tool
-that passes none of this counts as not installed and the feature that wanted it
-is skipped; there is no fallback to `PATH`.
+its own. The path is walked one component at a time from `/`, every component
+has to be owned by `root` and unwritable by anyone else, and each is opened
+with `O_NOFOLLOW`, so a component swapped for a symlink is a failure rather
+than a redirection. A component that is already a symlink is followed only if
+the link itself belongs to `root`, and its target is then walked the same way.
+What the plugin executes is the descriptor that walk produced, not the name, so
+nothing that happens to the path afterwards changes what runs. Nothing your own
+account can modify is ever executed, which is also why no command is consulted
+for a GitHub token. A tool that fails any of this counts as not installed and
+the feature that wanted it is skipped; there is no fallback to `PATH`.
+
+One wrinkle, disclosed because it looks like a hole and is not: `PrivateTmp=yes`
+puts the poll in a user namespace that maps only your own uid, and every
+root-owned file reports the overflow uid (`nobody`) there instead of `0`.
+Ownership is unobservable in that namespace rather than absent, so the overflow
+uid stands in for `root` — and only when `/proc/self/uid_map` shows that root
+is genuinely unmapped. Nothing runs as that account and the write bits are
+still enforced.
 
 The poll timer sets its own `PATH`, the widget and panel clear the environment
 they inherit from the compositor, and `install.sh` names `/usr/bin/systemctl`
@@ -219,11 +231,15 @@ at the ceiling rather than after it has already produced that much. The ceiling
 is not tighter than that because `pacman -Qi` legitimately runs just under
 1 MiB per thousand installed packages.
 
-Both state files are written to an unpredictably named temporary file in the
-target's own directory, created `O_EXCL` and `0600`, and then moved into place
-with `rename(2)`. Nothing pre-existing at the target path is followed or
-written through, including a symlink. The two systemd unit files are written
-the same way.
+Both state files are written through a directory descriptor rather than a
+path. The directory is validated component by component the same way, opened
+once, and then the create, the write, the `fsync` and the `rename(2)` all
+happen relative to that descriptor, so nothing is resolved by name a second
+time and a parent directory swapped in between has nothing left to redirect.
+The temporary name is random and created `O_EXCL`, `O_NOFOLLOW` and `0600`, so
+nothing pre-placed under it is followed or clobbered, and the directory itself
+is `fsync`ed so the rename survives a crash rather than only the contents. The
+two systemd unit files are written the same way.
 
 ## Tracked repositories
 

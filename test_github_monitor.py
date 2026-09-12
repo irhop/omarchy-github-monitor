@@ -498,12 +498,55 @@ for directory in ghmon.TOOL_DIRS:
     info = pathlib.Path(directory).resolve().stat()
     assert info.st_uid == 0, directory
     assert not info.st_mode & 0o022, directory
-assert ghmon.system_owned(pathlib.Path("/usr/bin/systemctl"))
+# Every component down to / has to belong to a trusted account, not just the
+# binary and the directory holding it.
+handle = ghmon.open_verified(pathlib.Path("/usr/bin/systemctl"),
+                             ghmon.SYSTEM_OWNERS, directory=False)
+os.close(handle)
 with tempfile.TemporaryDirectory() as tmp:
     impostor = pathlib.Path(tmp) / "systemctl"
     impostor.write_text("#!/usr/bin/bash\ntrue\n")
     impostor.chmod(0o755)
-    assert not ghmon.system_owned(impostor)
+    # Owned by this account, so root-only resolution has to refuse it even
+    # though the file itself looks fine.
+    try:
+        ghmon.open_verified(impostor, ghmon.SYSTEM_OWNERS, directory=False)
+        raise AssertionError("a user-owned ancestor must not be trusted")
+    except PermissionError:
+        pass
+    # The same path is fine when this account is trusted, which is what the
+    # plugin's own state files are checked against.
+    os.close(ghmon.open_verified(impostor, ghmon.USER_OWNERS, directory=False))
+
+    # A component that is a link is not followed on the strength of the name
+    # it points at: the link has to belong to a trusted account too. This one
+    # does, so it resolves; a root-only walk still refuses it.
+    linked = pathlib.Path(tmp) / "link"
+    linked.symlink_to(impostor)
+    os.close(ghmon.open_verified(linked, ghmon.USER_OWNERS, directory=False))
+    try:
+        ghmon.open_verified(linked, ghmon.SYSTEM_OWNERS, directory=False)
+        raise AssertionError("a user-owned link must not be trusted as root's")
+    except PermissionError:
+        pass
+
+    # A relative path has no components to check, so it is refused outright.
+    try:
+        ghmon.open_verified(pathlib.Path("usr/bin/systemctl"), ghmon.SYSTEM_OWNERS)
+        raise AssertionError("a relative path must be refused")
+    except ValueError:
+        pass
+
+# /tmp is world-writable, and sticky, which is the one case where that is not
+# a way to replace someone else's file.
+assert ghmon.owner_ok(os.stat("/tmp"), ghmon.USER_OWNERS)
+assert ghmon.owner_ok(os.stat("/usr/bin"), ghmon.SYSTEM_OWNERS)
+# root is trusted always; the overflow uid stands in for it only where this
+# process cannot see root as root at all.
+assert 0 in ghmon.SYSTEM_OWNERS
+assert (ghmon.OVERFLOW_UID in ghmon.SYSTEM_OWNERS) == ghmon.root_is_unmapped()
+assert os.getuid() in ghmon.USER_OWNERS
+assert not ghmon.owner_ok(os.stat("/usr/bin"), frozenset({os.getuid() + 1}))
 
 # The ceiling is enforced while the child is still writing, not after it
 # exits: `cat /dev/zero` never exits, so the deadline must not be what stops
@@ -560,5 +603,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert elsewhere.read_text() == "untouched"
     # No temporary file is left behind, under any name.
     assert sorted(p.name for p in root.iterdir()) == ["elsewhere", "state.json"]
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+    # Missing parents are created as the path is walked, and nothing above the
+    # target is resolved by name afterwards.
+    nested = root / "one" / "two" / "state.json"
+    ghmon.write_atomic(nested, "nested")
+    assert nested.read_text() == "nested"
+    assert oct((root / "one").stat().st_mode & 0o777) == "0o700"
 
 print("atomic writes covered")
