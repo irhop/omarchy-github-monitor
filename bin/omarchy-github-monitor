@@ -17,10 +17,13 @@ import html
 import json
 import os
 import re
+import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -51,9 +54,6 @@ TOOL_DIRS = (
     "/usr/bin",
     "/bin",
     "/usr/share/omarchy/bin",
-    # mise keeps its tools under the user's data directory and exposes them as
-    # shims, so there is no system path to pin `gh` to on a mise install.
-    str(Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "mise/shims"),
 )
 
 # Sixteen mebibytes per stream. `pacman -Qi` is the big one and runs just under
@@ -63,24 +63,55 @@ TOOL_DIRS = (
 MAX_OUTPUT = 16 << 20
 
 
+def system_owned(path):
+    """True when only root can change what this path is, or what it points at.
+
+    Membership in TOOL_DIRS is not on its own an identity: a directory has to
+    be owned by root and unwritable by anyone else for its contents to mean
+    anything. Both the resolved file and the directory holding it are checked,
+    so a symlink into somewhere writable fails here rather than being executed.
+    """
+    for candidate in (path, path.parent):
+        try:
+            info = candidate.resolve(strict=True).stat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return False
+    return True
+
+
 @functools.lru_cache(maxsize=None)
 def tool(name):
-    """Absolute path of an allowed executable, or None when it is not there."""
+    """Absolute path of an allowed executable, or None when it is not there.
+
+    Only root-owned directories are searched, so nothing the user's own account
+    can write to is ever executed: there is no writable path left for a
+    replaced binary to arrive through between this check and the exec.
+    """
     for directory in TOOL_DIRS:
         candidate = Path(directory) / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if candidate.is_file() and os.access(candidate, os.X_OK) and system_owned(candidate):
             return str(candidate)
     return None
 
 
-def run(command, timeout, check=False):
-    """subprocess.run with an output ceiling and no surviving grandchildren.
+# Every group run() is currently supervising. A signal handler needs this
+# because the poll runs children concurrently and can be killed by the panel
+# mid-flight; without it the default SIGTERM exit would leave them running.
+LIVE = set()
+LIVE_LOCK = threading.Lock()
 
-    The child gets its own session, so a timeout tears down the whole process
-    group: `docker --context` over an SSH endpoint spawns ssh, which would
-    otherwise outlive the poll that started it. Output lands in temporary files
-    rather than pipes, so a tool that streams forever cannot grow the parent's
-    memory, and a result past MAX_OUTPUT is refused rather than parsed.
+
+def run(command, timeout, check=False):
+    """subprocess.run with a streamed output ceiling and no surviving children.
+
+    The child gets its own session, so tearing it down reaches the whole group:
+    `docker --context` over an SSH endpoint spawns ssh, which would otherwise
+    outlive the poll that started it. Output is read as it arrives and counted
+    against MAX_OUTPUT while the child is still running, so a tool that streams
+    without end is stopped at the ceiling rather than after it has already
+    written that much somewhere.
 
     Raises FileNotFoundError when the tool is not installed, and
     subprocess.TimeoutExpired on a deadline, which is what the callers of
@@ -90,26 +121,56 @@ def run(command, timeout, check=False):
     if executable is None:
         raise FileNotFoundError(f"{command[0]} is not installed")
 
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        process = subprocess.Popen(
-            [executable] + list(command[1:]), stdout=out, stderr=err,
-            stdin=subprocess.DEVNULL, start_new_session=True,
-        )
-        try:
-            process.wait(timeout=timeout)
-        except BaseException:
-            terminate_group(process)
-            raise
+    argv = [executable] + list(command[1:])
+    process = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    with LIVE_LOCK:
+        LIVE.add(process)
 
-        texts = []
-        for handle in (out, err):
-            if handle.seek(0, os.SEEK_END) > MAX_OUTPUT:
-                raise subprocess.SubprocessError(f"{command[0]} produced more than {MAX_OUTPUT} bytes")
-            handle.seek(0)
-            texts.append(handle.read().decode("utf-8", "replace"))
+    deadline = time.monotonic() + timeout
+    collected = {process.stdout: [], process.stderr: []}
+    written = {process.stdout: 0, process.stderr: 0}
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in collected:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
 
-    result = subprocess.CompletedProcess([executable] + list(command[1:]),
-                                         process.returncode, texts[0], texts[1])
+            while selector.get_map():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                for key, _ in selector.select(left):
+                    chunk = key.fileobj.read(65536)
+                    if chunk is None:  # nothing ready after all
+                        continue
+                    if not chunk:  # end of stream
+                        selector.unregister(key.fileobj)
+                        continue
+                    written[key.fileobj] += len(chunk)
+                    if written[key.fileobj] > MAX_OUTPUT:
+                        raise subprocess.SubprocessError(
+                            f"{command[0]} produced more than {MAX_OUTPUT} bytes"
+                        )
+                    collected[key.fileobj].append(chunk)
+
+        process.wait(timeout=max(deadline - time.monotonic(), 0))
+    except BaseException:
+        terminate_group(process)
+        raise
+    finally:
+        with LIVE_LOCK:
+            LIVE.discard(process)
+        process.stdout.close()
+        process.stderr.close()
+
+    result = subprocess.CompletedProcess(
+        argv, process.returncode,
+        *(b"".join(collected[stream]).decode("utf-8", "replace")
+          for stream in (process.stdout, process.stderr)),
+    )
     if check:
         result.check_returncode()
     return result
@@ -117,21 +178,39 @@ def run(command, timeout, check=False):
 
 def terminate_group(process):
     """SIGTERM the child's whole group, then SIGKILL what is left of it."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        return
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:  # already gone, ProcessLookupError included
+            break
+        try:
+            process.wait(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    # Reap it even if both signals were somehow ignored, so no zombie is left.
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
+        pass
+
+
+def shut_down(signum, _frame):
+    """Tear down every child group before this process goes away.
+
+    The panel kills this helper by pid when its own deadline expires, and
+    Python's default SIGTERM exit would take the children's sessions with it
+    only if they shared a group, which they deliberately do not. So the groups
+    are torn down here, synchronously, before exiting.
+    """
+    with LIVE_LOCK:
+        pending = list(LIVE)
+        LIVE.clear()
+    for process in pending:
+        terminate_group(process)
+    # os._exit, not sys.exit: an exception unwinding through worker threads
+    # after the children are gone has nothing useful left to do.
+    os._exit(128 + signum)
 
 
 # Feed entry ids look like tag:github.com,2008:Repository/1234/v1.2.3
@@ -471,18 +550,18 @@ def http_get(url, headers=None, timeout=15):
 
 
 def find_token():
-    """First hit wins. Never stored, never logged, never written to state."""
+    """First hit wins. Never stored, never logged, never written to state.
+
+    The environment is the only source. `gh auth token` used to be consulted
+    too, but gh lives in a mise shim directory the user's own account can
+    write to, and executing from there during an unattended poll is not worth
+    a higher search allowance. A user who wants one exports the token instead:
+    `export GH_TOKEN=$(gh auth token)`.
+    """
     for var in ("GITHUB_TOKEN", "GH_TOKEN"):
         value = os.environ.get(var)
         if value:
             return value, var
-    try:
-        result = run(["gh", "auth", "token"], timeout=5)
-        token = result.stdout.strip()
-        if result.returncode == 0 and token:
-            return token, "gh auth token"
-    except (OSError, subprocess.SubprocessError):
-        pass
     return None, None
 
 
@@ -1306,10 +1385,10 @@ def cmd_status(args):
     print(f"  authentication{'':33}{source if token else 'none'}")
     if not token:
         print("\n  Authenticating raises the search allowance from 10 to 30 per minute.")
-        print("  Polling needs no token at all. Any of these is picked up automatically:")
-        print("    gh auth login          (recommended, browser flow, nothing to copy)")
-        print("    GITHUB_TOKEN=...       in the environment")
-        print("    GH_TOKEN=...")
+        print("  Polling needs no token at all. Either of these is picked up from the")
+        print("  environment; no executable is consulted, so gh is not run:")
+        print("    GITHUB_TOKEN=...")
+        print("    GH_TOKEN=...            e.g. export GH_TOKEN=$(gh auth token)")
     return 0
 
 
@@ -1339,6 +1418,12 @@ def cmd_bootstrap(args):
 
 
 def main():
+    # The panel and the timer both kill this process by pid on their own
+    # deadlines, so termination has to run the child teardown rather than the
+    # interpreter's default exit.
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, shut_down)
+
     parser = argparse.ArgumentParser(prog="omarchy-github-monitor", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1346,10 +1431,10 @@ def main():
     fetch.add_argument("-q", "--quiet", action="store_true")
     fetch.set_defaults(func=cmd_fetch)
 
-    run = sub.add_parser("run", help="poll in a loop (debugging; the timer is the real path)")
-    run.add_argument("-q", "--quiet", action="store_true")
-    run.add_argument("--interval", type=int, default=15, help="minutes between polls")
-    run.set_defaults(func=cmd_run)
+    looping = sub.add_parser("run", help="poll in a loop (debugging; the timer is the real path)")
+    looping.add_argument("-q", "--quiet", action="store_true")
+    looping.add_argument("--interval", type=int, default=15, help="minutes between polls")
+    looping.set_defaults(func=cmd_run)
 
     listing = sub.add_parser("list", help="show tracked repositories")
     listing.set_defaults(func=cmd_list)

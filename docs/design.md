@@ -44,9 +44,8 @@ detection needs.
 | commits since latest tag | `compare` API | omitted |
 | exact prerelease flag | `releases` API | inferred from the tag (`-rc`, `-beta`, `-alpha`, `-pre`) |
 
-If a token is present in the environment (`GITHUB_TOKEN`, `GH_TOKEN`) or
-obtainable from `gh auth token`, the daemon adds both. It is never required,
-and the plugin never stores one.
+If a token is present in the environment (`GITHUB_TOKEN`, `GH_TOKEN`), the
+daemon adds both. It is never required, and the plugin never stores one.
 
 ## Rate limits and authentication
 
@@ -67,10 +66,10 @@ search                                          10/min, 9 left
 authentication                                  none
 
 Authenticating adds: commits since latest tag, exact prerelease flags
-Any of these is picked up automatically:
-  gh auth login          (recommended, browser flow, nothing to copy)
-  GITHUB_TOKEN=...       in the environment
-  GH_TOKEN=...
+Either of these is picked up from the environment; no executable is
+consulted, so gh is not run:
+  GITHUB_TOKEN=...
+  GH_TOKEN=...            e.g. export GH_TOKEN=$(gh auth token)
 ```
 
 **In the panel.** One dim footer line, `unauthenticated — commits since tag
@@ -78,8 +77,12 @@ unavailable`. A statement, not a call to action: no button, no dialog, no
 badge. It is absent entirely when a token is found.
 
 **Token handling.** Read at fetch time from `GITHUB_TOKEN`, then `GH_TOKEN`,
-then `gh auth token`, first hit wins. Never written to disk, never copied into
-the state file, never logged. Revocation happens where the token was granted.
+first hit wins. The environment is the only source: `gh auth token` used to be
+consulted too, and was dropped because `gh` commonly lives in a mise shim
+directory the user's own account can write to, which is not somewhere an
+unattended poll should be executing from. Never written to disk, never copied
+into the state file, never logged. Revocation happens where the token was
+granted.
 
 This is only tenable because polling costs nothing against the API budget.
 Authentication buys two enrichment fields, so the message can stay a statement

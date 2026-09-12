@@ -9,6 +9,7 @@ No network, no framework, no fixtures on disk. Run it directly:
 import html as html_module
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 import time
@@ -491,13 +492,57 @@ except subprocess.TimeoutExpired:
     pass
 assert time.monotonic() - start < 10
 
-# Output past the ceiling is refused instead of parsed.
+# Every searched directory has to be one only root can write to, or the
+# absolute paths taken from it would not mean anything.
+for directory in ghmon.TOOL_DIRS:
+    info = pathlib.Path(directory).resolve().stat()
+    assert info.st_uid == 0, directory
+    assert not info.st_mode & 0o022, directory
+assert ghmon.system_owned(pathlib.Path("/usr/bin/systemctl"))
+with tempfile.TemporaryDirectory() as tmp:
+    impostor = pathlib.Path(tmp) / "systemctl"
+    impostor.write_text("#!/usr/bin/bash\ntrue\n")
+    impostor.chmod(0o755)
+    assert not ghmon.system_owned(impostor)
+
+# The ceiling is enforced while the child is still writing, not after it
+# exits: `cat /dev/zero` never exits, so the deadline must not be what stops
+# it here.
+start = time.monotonic()
 try:
-    ghmon.run(["head", "-c", str(ghmon.MAX_OUTPUT + 1), "/dev/zero"], timeout=20)
-    raise AssertionError("output past MAX_OUTPUT must be refused")
-except subprocess.SubprocessError:
-    pass
+    ghmon.run(["cat", "/dev/zero"], timeout=120)
+    raise AssertionError("an endless stream must be refused at the ceiling")
+except subprocess.SubprocessError as refused:
+    assert not isinstance(refused, subprocess.TimeoutExpired), "stopped by the deadline, not the ceiling"
+assert time.monotonic() - start < 60
 assert ghmon.run(["head", "-c", "16", "/dev/zero"], timeout=20).returncode == 0
+
+# A deadline reaches the child's descendants, not just the child. bash leaves
+# two sleeps in its own group; both have to be gone.
+marker = "31415926"
+try:
+    ghmon.run(["bash", "-c", f"sleep {marker} & sleep {marker}"], timeout=1)
+    raise AssertionError("that must not finish inside a 1s deadline")
+except subprocess.TimeoutExpired:
+    pass
+leftover = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {marker}"],
+                          capture_output=True, text=True)
+assert leftover.stdout.strip() == "", "a timeout left descendants behind"
+
+# A token comes from the environment and nowhere else: nothing is executed to
+# find one, because the only tool that could provide it lives somewhere the
+# user's own account can write to.
+guard = ghmon.run
+ghmon.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("find_token ran a command"))
+try:
+    for variable in ("GITHUB_TOKEN", "GH_TOKEN"):
+        os.environ.pop(variable, None)
+    assert ghmon.find_token() == (None, None)
+    os.environ["GH_TOKEN"] = "not-a-real-token"
+    assert ghmon.find_token() == ("not-a-real-token", "GH_TOKEN")
+finally:
+    os.environ.pop("GH_TOKEN", None)
+    ghmon.run = guard
 
 print("tool resolution and process teardown covered")
 

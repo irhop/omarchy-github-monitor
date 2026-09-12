@@ -64,10 +64,11 @@ counted against the API's 60-requests-per-hour unauthenticated budget.
 Nineteen repositories take about two seconds, and unchanged feeds answer
 `304 Not Modified`.
 
-If a token happens to be present — `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth
-token` — it is used to raise the search allowance from ten requests a minute
-to thirty. Polling never needs one. Nothing prompts you for a token, and none
-is ever stored.
+If a token is present in the environment — `GITHUB_TOKEN` or `GH_TOKEN` — it
+is used to raise the search allowance from ten requests a minute to thirty.
+Polling never needs one. Nothing prompts you for a token, none is ever stored,
+and no command is run to find one: if you want the higher allowance with `gh`,
+export it yourself with `export GH_TOKEN=$(gh auth token)`.
 
 ## The dot means unseen
 
@@ -192,21 +193,31 @@ and touches. Nothing here needs root.
 ### How it runs those commands
 
 None of them is looked up on `PATH`. Each is resolved once against a fixed list
-of directories — `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/share/omarchy/bin`,
-and mise's shim directory, which is the only place `gh` exists on a mise install
-— and then called by absolute path. A tool found nowhere in that list counts as
-not installed, and the feature that wanted it is skipped rather than falling
-back to whatever `PATH` offers. The poll timer sets its own `PATH`, the widget
-and panel clear the environment they inherit from the compositor, and
-`install.sh` names `/usr/bin/systemctl` and `/usr/share/omarchy/bin/omarchy`
-outright.
+of directories — `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/share/omarchy/bin`
+— and called by absolute path afterwards. Being on that list is not enough on
+its own: both the resolved file and the directory holding it must be owned by
+`root` and unwritable by anyone else, so a symlink pointing somewhere you can
+write is refused rather than executed. Nothing your own account can modify is
+ever run, which is also why no command is consulted for a GitHub token. A tool
+that passes none of this counts as not installed and the feature that wanted it
+is skipped; there is no fallback to `PATH`.
 
-Every child process has a deadline. On expiry it gets `SIGTERM` and then
-`SIGKILL`, and in the helper the signal goes to the whole process group, so a
-`docker --context` that opened an SSH connection to an unreachable host leaves
-nothing behind. Output is read from temporary files with a 16 MiB ceiling per
-stream rather than from pipes, so a tool that streams without end cannot grow
-the plugin's memory.
+The poll timer sets its own `PATH`, the widget and panel clear the environment
+they inherit from the compositor, and `install.sh` names `/usr/bin/systemctl`
+and `/usr/share/omarchy/bin/omarchy` outright.
+
+Every child process has a deadline, and each runs in its own session so that
+ending it reaches everything it started — a `docker --context` against an
+unreachable host opens an SSH connection that would otherwise outlive it. On
+expiry the group gets `SIGTERM` and then `SIGKILL`. The helper also handles
+`SIGTERM`, `SIGHUP` and `SIGINT` itself and tears down its live children before
+exiting, so the panel killing it on its own deadline does not orphan anything.
+
+Output is read as it arrives and counted against a 16 MiB ceiling per stream
+while the child is still running, so a tool that streams without end is stopped
+at the ceiling rather than after it has already produced that much. The ceiling
+is not tighter than that because `pacman -Qi` legitimately runs just under
+1 MiB per thousand installed packages.
 
 Both state files are written to an unpredictably named temporary file in the
 target's own directory, created `O_EXCL` and `0600`, and then moved into place
