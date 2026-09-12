@@ -84,6 +84,29 @@ BarWidget {
 
   function poll() {
     pollProcess.running = true
+    pollDeadline.escalated = false
+    pollDeadline.restart()
+  }
+
+  // A poll that stopped making progress must not sit there forever. SIGTERM
+  // first, SIGKILL two seconds later; the helper cleans up after itself in
+  // between. Twenty feeds finish in seconds, so two minutes means stuck.
+  Timer {
+    id: pollDeadline
+    property bool escalated: false
+    interval: escalated ? 2000 : 120000
+    onTriggered: {
+      if (!pollProcess.running) {
+        escalated = false
+        return
+      }
+      pollProcess.signal(escalated ? 9 : 15)
+      if (escalated) escalated = false
+      else {
+        escalated = true
+        restart()
+      }
+    }
   }
 
   implicitWidth: button.implicitWidth
@@ -114,6 +137,18 @@ BarWidget {
 
   Process {
     id: pollProcess
+    // Same as the panel: a fixed PATH rather than whatever the compositor was
+    // started with, and only the variables the helper actually reads.
+    clearEnvironment: true
+    environment: {
+      var env = { "PATH": "/usr/local/bin:/usr/bin:/bin" }
+      var keep = ["HOME", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+      for (var i = 0; i < keep.length; i++) {
+        var value = Quickshell.env(keep[i])
+        if (value) env[keep[i]] = value
+      }
+      return env
+    }
     command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.irhop.github-monitor/bin/omarchy-github-monitor", "fetch", "--quiet"]
   }
 

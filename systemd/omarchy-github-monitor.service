@@ -7,6 +7,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=@BIN@ fetch --quiet
+# The poll runs unattended, so it gets a fixed PATH rather than whatever the
+# user manager was started with.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # Polling public feeds needs no privilege at all.
 NoNewPrivileges=yes
 PrivateTmp=yes

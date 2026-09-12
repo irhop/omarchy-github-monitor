@@ -189,6 +189,31 @@ and touches. Nothing here needs root.
 | runs | `wl-copy` (copy buttons), `xdg-open` (open on GitHub), `omarchy-notification-send`, `systemctl --user` (timer setup only), and for `installed`: `pacman -Qi`, `mise`, `docker` |
 | never | asks for, stores, or transmits a GitHub token; a token in your environment is used only to raise the search allowance |
 
+### How it runs those commands
+
+None of them is looked up on `PATH`. Each is resolved once against a fixed list
+of directories — `/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/share/omarchy/bin`,
+and mise's shim directory, which is the only place `gh` exists on a mise install
+— and then called by absolute path. A tool found nowhere in that list counts as
+not installed, and the feature that wanted it is skipped rather than falling
+back to whatever `PATH` offers. The poll timer sets its own `PATH`, the widget
+and panel clear the environment they inherit from the compositor, and
+`install.sh` names `/usr/bin/systemctl` and `/usr/share/omarchy/bin/omarchy`
+outright.
+
+Every child process has a deadline. On expiry it gets `SIGTERM` and then
+`SIGKILL`, and in the helper the signal goes to the whole process group, so a
+`docker --context` that opened an SSH connection to an unreachable host leaves
+nothing behind. Output is read from temporary files with a 16 MiB ceiling per
+stream rather than from pipes, so a tool that streams without end cannot grow
+the plugin's memory.
+
+Both state files are written to an unpredictably named temporary file in the
+target's own directory, created `O_EXCL` and `0600`, and then moved into place
+with `rename(2)`. Nothing pre-existing at the target path is followed or
+written through, including a symlink. The two systemd unit files are written
+the same way.
+
 ## Tracked repositories
 
 One `owner/repo` per line in `~/.config/omarchy-github-monitor/repos.txt`.

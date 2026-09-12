@@ -50,6 +50,43 @@ Panel {
     return env
   }
 
+  // No child of the panel is allowed to hang it. Every one is started through
+  // here, which arms a deadline; on expiry the whole set still running gets
+  // SIGTERM and then SIGKILL two seconds later. Each of these children is the
+  // plugin's own helper, which tears down its own descendants as it goes.
+  function start(process) {
+    process.running = true
+    deadline.escalated = false
+    deadline.restart()
+  }
+
+  Timer {
+    id: deadline
+    property bool escalated: false
+    interval: escalated ? 2000 : 30000
+    onTriggered: {
+      var processes = [bootstrapProcess, searchProcess, addProcess, seenProcess,
+                       preProcess, muteProcess, copyProcess]
+      var stuck = []
+      for (var i = 0; i < processes.length; i++)
+        if (processes[i].running) stuck.push(processes[i])
+
+      if (stuck.length === 0) {
+        escalated = false
+        return
+      }
+      for (var j = 0; j < stuck.length; j++) stuck[j].signal(escalated ? 9 : 15)
+      if (escalated) {
+        escalated = false
+        root.busy = false
+        root.notice = "That took too long and was stopped."
+      } else {
+        escalated = true
+        restart()
+      }
+    }
+  }
+
   // `owner/repo` or a github.com URL is unambiguous, so it is added rather
   // than searched for. Everything else is a search query.
   function looksLikeRepo(value) {
@@ -65,11 +102,11 @@ Panel {
     busy = true
     if (looksLikeRepo(value)) {
       addProcess.command = [monitorBin, "add", "--json", value]
-      addProcess.running = true
+      root.start(addProcess)
     } else {
       // On Enter, never per keystroke: search allows ten requests a minute.
       searchProcess.command = [monitorBin, "search", "--json", "-n", "12", value]
-      searchProcess.running = true
+      root.start(searchProcess)
     }
   }
 
@@ -78,14 +115,14 @@ Panel {
     busy = true
     notice = ""
     addProcess.command = [monitorBin, "add", "--json", repo]
-    addProcess.running = true
+    root.start(addProcess)
   }
 
   function runBootstrap() {
     if (busy) return
     busy = true
     notice = ""
-    bootstrapProcess.running = true
+    root.start(bootstrapProcess)
   }
 
   Process {
@@ -228,7 +265,7 @@ Panel {
 
   function markSeen() {
     seenProcess.command = [monitorBin, "seen"]
-    seenProcess.running = true
+    root.start(seenProcess)
   }
 
   function togglePrereleases(entry) {
@@ -239,7 +276,7 @@ Panel {
     preProcess.command = entry.prereleases_included
       ? [monitorBin, "pre", "--off", entry.repo]
       : [monitorBin, "pre", entry.repo]
-    preProcess.running = true
+    root.start(preProcess)
   }
 
   Process {
@@ -258,7 +295,7 @@ Panel {
     muteProcess.command = entry.overdue_muted
       ? [monitorBin, "mute", "--unmute", entry.repo]
       : [monitorBin, "mute", entry.repo]
-    muteProcess.running = true
+    root.start(muteProcess)
   }
 
   Process {
@@ -291,7 +328,9 @@ Panel {
 
   function openInBrowser(url) {
     if (!url) return
-    Quickshell.execDetached(["xdg-open", url])
+    // Detached on purpose: the browser has to outlive the panel, so this one
+    // gets no deadline. Absolute, like every other command here.
+    Quickshell.execDetached(["/usr/bin/xdg-open", url])
   }
 
   function repoUrl(entry) {
@@ -307,8 +346,8 @@ Panel {
 
   function copyToClipboard(value, description) {
     if (!value) return
-    copyProcess.command = ["wl-copy", "--", value]
-    copyProcess.running = true
+    copyProcess.command = ["/usr/bin/wl-copy", "--", value]
+    root.start(copyProcess)
     toast = "Copied " + description
     toastTimer.restart()
   }

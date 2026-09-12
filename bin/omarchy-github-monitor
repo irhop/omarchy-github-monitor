@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Track GitHub releases without credentials, for the Omarchy bar.
 
 Polling reads each repository's releases.atom feed, which costs nothing against
@@ -11,13 +11,16 @@ and is never asked for or stored. Polling never needs one. See docs/design.md.
 
 import argparse
 import concurrent.futures
+import functools
 import gzip
 import html
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +39,100 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") 
 REPO_FILE = CONFIG_DIR / "repos.txt"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "omarchy-github-monitor"
 STATE_FILE = STATE_DIR / "state.json"
+
+# ------------------------------------------------------------------- tools
+
+# Every executable is resolved once from this fixed list and then called by
+# absolute path. Nothing is taken from PATH: the poll runs unattended from a
+# systemd timer, so a directory prepended to PATH must not get to decide what
+# runs. A tool that is not in one of these directories counts as not installed.
+TOOL_DIRS = (
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/share/omarchy/bin",
+    # mise keeps its tools under the user's data directory and exposes them as
+    # shims, so there is no system path to pin `gh` to on a mise install.
+    str(Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "mise/shims"),
+)
+
+# Sixteen mebibytes per stream. `pacman -Qi` is the big one and runs just under
+# one mebibyte per thousand packages, so the ceiling has to clear a large
+# install by a wide margin; past it, the output is a runaway or a hostile
+# endpoint rather than an answer.
+MAX_OUTPUT = 16 << 20
+
+
+@functools.lru_cache(maxsize=None)
+def tool(name):
+    """Absolute path of an allowed executable, or None when it is not there."""
+    for directory in TOOL_DIRS:
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def run(command, timeout, check=False):
+    """subprocess.run with an output ceiling and no surviving grandchildren.
+
+    The child gets its own session, so a timeout tears down the whole process
+    group: `docker --context` over an SSH endpoint spawns ssh, which would
+    otherwise outlive the poll that started it. Output lands in temporary files
+    rather than pipes, so a tool that streams forever cannot grow the parent's
+    memory, and a result past MAX_OUTPUT is refused rather than parsed.
+
+    Raises FileNotFoundError when the tool is not installed, and
+    subprocess.TimeoutExpired on a deadline, which is what the callers of
+    subprocess.run already expect.
+    """
+    executable = tool(command[0])
+    if executable is None:
+        raise FileNotFoundError(f"{command[0]} is not installed")
+
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = subprocess.Popen(
+            [executable] + list(command[1:]), stdout=out, stderr=err,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except BaseException:
+            terminate_group(process)
+            raise
+
+        texts = []
+        for handle in (out, err):
+            if handle.seek(0, os.SEEK_END) > MAX_OUTPUT:
+                raise subprocess.SubprocessError(f"{command[0]} produced more than {MAX_OUTPUT} bytes")
+            handle.seek(0)
+            texts.append(handle.read().decode("utf-8", "replace"))
+
+    result = subprocess.CompletedProcess([executable] + list(command[1:]),
+                                         process.returncode, texts[0], texts[1])
+    if check:
+        result.check_returncode()
+    return result
+
+
+def terminate_group(process):
+    """SIGTERM the child's whole group, then SIGKILL what is left of it."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
 
 # Feed entry ids look like tag:github.com,2008:Repository/1234/v1.2.3
 TAG_FROM_ID = re.compile(r"/([^/]+)$")
@@ -278,11 +375,26 @@ def load_state():
 
 def write_atomic(path, text):
     """Temp file beside the target, then replace. A reader never sees a partial
-    file, which matters because QML watches this one."""
+    file, which matters because QML watches this one.
+
+    mkstemp rather than a predictable `.tmp` sibling: the name cannot be
+    guessed, the file is created O_EXCL and 0600, and nothing pre-placed at
+    that path is followed or clobbered. os.replace does not follow a symlink
+    sitting at the target either, so the write cannot be redirected out of this
+    directory.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    handle, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w") as opened:
+            opened.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 SHELL_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy/shell.json"
@@ -365,9 +477,7 @@ def find_token():
         if value:
             return value, var
     try:
-        result = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
-        )
+        result = run(["gh", "auth", "token"], timeout=5)
         token = result.stdout.strip()
         if result.returncode == 0 and token:
             return token, "gh auth token"
@@ -569,7 +679,7 @@ def fetch_repo(repo, previous, opts, now, muted=False, include_pre=None):
 def notify(title, message):
     for command in (["omarchy-notification-send", title, message], ["notify-send", title, message]):
         try:
-            subprocess.run(command, check=True, capture_output=True, timeout=5)
+            run(command, timeout=5, check=True)
             return
         except (OSError, subprocess.SubprocessError):
             continue
@@ -825,7 +935,7 @@ def pacman_packages():
     the container matcher prefers the OCI source label.
     """
     try:
-        result = subprocess.run(["pacman", "-Qi"], capture_output=True, text=True, timeout=20)
+        result = run(["pacman", "-Qi"], timeout=20)
     except (OSError, subprocess.SubprocessError):
         return []
     if result.returncode != 0:
@@ -851,9 +961,8 @@ def pacman_packages():
 def mise_tools():
     """Installed mise tools, mapped through the registry's backend id."""
     try:
-        registry = subprocess.run(["mise", "registry"], capture_output=True, text=True, timeout=20)
-        listed = subprocess.run(["mise", "ls", "--installed", "--json"],
-                                capture_output=True, text=True, timeout=20)
+        registry = run(["mise", "registry"], timeout=20)
+        listed = run(["mise", "ls", "--installed", "--json"], timeout=20)
     except (OSError, subprocess.SubprocessError):
         return []
     if registry.returncode != 0 or listed.returncode != 0:
@@ -890,10 +999,7 @@ def mise_tools():
 def docker_contexts():
     """Every configured Docker context, local socket included."""
     try:
-        result = subprocess.run(
-            ["docker", "context", "ls", "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=10,
-        )
+        result = run(["docker", "context", "ls", "--format", "{{.Name}}"], timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -915,19 +1021,15 @@ def containers_on(context, timeout=25):
         "\t{{index .Config.Labels \"org.opencontainers.image.source\"}}"
     )
     try:
-        listed = subprocess.run(
-            ["docker", "--context", context, "ps", "--format", "{{.ID}}"],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        listed = run(["docker", "--context", context, "ps", "--format", "{{.ID}}"],
+                     timeout=timeout)
         if listed.returncode != 0:
             return None, (listed.stderr.strip().splitlines() or ["unreachable"])[-1]
         ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
         if not ids:
             return [], None
-        inspected = subprocess.run(
-            ["docker", "--context", context, "inspect", "--format", template] + ids,
-            capture_output=True, text=True, timeout=timeout,
-        )
+        inspected = run(["docker", "--context", context, "inspect", "--format", template] + ids,
+                        timeout=timeout)
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s (Tailscale SSH check?)"
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1182,10 +1284,8 @@ def cmd_status(args):
 
     timer = "not installed"
     try:
-        active = subprocess.run(
-            ["systemctl", "--user", "is-active", "omarchy-github-monitor.timer"],
-            capture_output=True, text=True, timeout=5,
-        )
+        active = run(["systemctl", "--user", "is-active", "omarchy-github-monitor.timer"],
+                     timeout=5)
         if active.stdout.strip():
             timer = active.stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -1224,17 +1324,16 @@ def cmd_bootstrap(args):
         if args.dry_run:
             print(f"would write {unit_dir / unit}")
         else:
-            (unit_dir / unit).write_text(text)
+            write_atomic(unit_dir / unit, text)
 
     if args.dry_run:
         print("would run: systemctl --user daemon-reload")
         print("would run: systemctl --user enable --now omarchy-github-monitor.timer")
         return 0
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(
-        ["systemctl", "--user", "enable", "--now", "omarchy-github-monitor.timer"], check=True
-    )
+    run(["systemctl", "--user", "daemon-reload"], timeout=30, check=True)
+    run(["systemctl", "--user", "enable", "--now", "omarchy-github-monitor.timer"],
+        timeout=30, check=True)
     print("Timer enabled. First poll runs now.")
     return 0
 

@@ -9,7 +9,9 @@ No network, no framework, no fixtures on disk. Run it directly:
 import html as html_module
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pathlib
@@ -466,3 +468,52 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "!overdue" in flags
 
 print("prerelease control covered")
+
+
+# --------------------------------------------------------- tools and writes
+
+# A tool outside the allowed directories does not exist as far as the daemon is
+# concerned, whatever PATH says.
+assert ghmon.tool("systemctl") == "/usr/bin/systemctl"
+assert ghmon.tool("omarchy-github-monitor-not-a-real-tool") is None
+try:
+    ghmon.run(["omarchy-github-monitor-not-a-real-tool"], timeout=1)
+    raise AssertionError("a missing tool must not be run")
+except FileNotFoundError:
+    pass
+
+# A deadline tears down the whole group rather than leaving the child behind.
+start = time.monotonic()
+try:
+    ghmon.run(["sleep", "30"], timeout=1)
+    raise AssertionError("sleep 30 must not finish inside a 1s deadline")
+except subprocess.TimeoutExpired:
+    pass
+assert time.monotonic() - start < 10
+
+# Output past the ceiling is refused instead of parsed.
+try:
+    ghmon.run(["head", "-c", str(ghmon.MAX_OUTPUT + 1), "/dev/zero"], timeout=20)
+    raise AssertionError("output past MAX_OUTPUT must be refused")
+except subprocess.SubprocessError:
+    pass
+assert ghmon.run(["head", "-c", "16", "/dev/zero"], timeout=20).returncode == 0
+
+print("tool resolution and process teardown covered")
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = pathlib.Path(tmp)
+    # A symlink sitting at the target is replaced, not followed: the file it
+    # points at must be untouched.
+    elsewhere = root / "elsewhere"
+    elsewhere.write_text("untouched")
+    target = root / "state.json"
+    target.symlink_to(elsewhere)
+    ghmon.write_atomic(target, "written")
+    assert not target.is_symlink()
+    assert target.read_text() == "written"
+    assert elsewhere.read_text() == "untouched"
+    # No temporary file is left behind, under any name.
+    assert sorted(p.name for p in root.iterdir()) == ["elsewhere", "state.json"]
+
+print("atomic writes covered")
