@@ -613,3 +613,78 @@ with tempfile.TemporaryDirectory() as tmp:
     assert oct((root / "one").stat().st_mode & 0o777) == "0o700"
 
 print("atomic writes covered")
+
+
+# ---- bounded response bodies
+import gzip
+import io
+import tracemalloc
+import urllib.error
+
+
+def rejected(call):
+    try:
+        call()
+    except OSError:
+        return True
+    return False
+
+
+# The raw read stops one byte past the limit and refuses anything longer.
+assert ghmon.read_bounded(io.BytesIO(b"a" * 100), limit=100) == b"a" * 100
+assert rejected(lambda: ghmon.read_bounded(io.BytesIO(b"a" * 101), limit=100))
+
+# Exactly the limit inflates; one byte more is refused, not truncated.
+assert ghmon.gunzip_bounded(gzip.compress(b"a" * 100), limit=100) == b"a" * 100
+assert rejected(lambda: ghmon.gunzip_bounded(gzip.compress(b"a" * 101), limit=100))
+
+# One member only: a second member, trailing bytes, a cut-off stream and
+# garbage are all refused.
+one = gzip.compress(b"first")
+assert rejected(lambda: ghmon.gunzip_bounded(one + gzip.compress(b"second")))
+assert rejected(lambda: ghmon.gunzip_bounded(one + b"\0"))
+assert rejected(lambda: ghmon.gunzip_bounded(one[:-4]))
+assert rejected(lambda: ghmon.gunzip_bounded(b"not gzip at all"))
+
+# A bomb that fits under the compressed cap costs a small multiple of the
+# decompressed cap in memory (inflation blocks plus their joined result), not
+# its own expanded size.
+bomb = gzip.compress(bytes(64 * 1024 * 1024))
+assert len(bomb) < ghmon.MAX_BODY_BYTES
+tracemalloc.start()
+assert rejected(lambda: ghmon.gunzip_bounded(bomb))
+peak = tracemalloc.get_traced_memory()[1]
+tracemalloc.stop()
+assert peak < 3 * ghmon.MAX_BODY_BYTES, f"bomb peaked at {peak} bytes"
+
+
+# Through http_get: rejections surface as OSError, which every caller already
+# handles, and an oversized error body is dropped rather than read whole.
+class FakeResponse(io.BytesIO):
+    status = 200
+
+    def __init__(self, data, headers):
+        super().__init__(data)
+        self.headers = headers
+
+
+real_urlopen = ghmon.urllib.request.urlopen
+try:
+    ghmon.urllib.request.urlopen = lambda *a, **k: FakeResponse(
+        bomb, {"Content-Encoding": "gzip"})
+    assert rejected(lambda: ghmon.http_get("https://example.invalid/"))
+
+    ghmon.urllib.request.urlopen = lambda *a, **k: FakeResponse(
+        gzip.compress(b"<feed/>"), {"Content-Encoding": "gzip"})
+    assert ghmon.http_get("https://example.invalid/")[2] == "<feed/>"
+
+    def huge_error(*a, **k):
+        raise urllib.error.HTTPError(
+            "https://example.invalid/", 500, "boom", {},
+            io.BytesIO(b"x" * (ghmon.MAX_BODY_BYTES + 1)))
+    ghmon.urllib.request.urlopen = huge_error
+    assert ghmon.http_get("https://example.invalid/") == (500, {}, "")
+finally:
+    ghmon.urllib.request.urlopen = real_urlopen
+
+print("bounded response bodies covered")

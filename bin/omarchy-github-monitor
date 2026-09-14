@@ -13,7 +13,6 @@ import argparse
 import concurrent.futures
 import functools
 import errno
-import gzip
 import html
 import json
 import os
@@ -29,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -689,6 +689,33 @@ def settings(state=None):
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
 
+# Rejections are OSError so every caller's existing network-failure handling
+# records them against the one repository instead of crashing the poll.
+def read_bounded(stream, limit=MAX_BODY_BYTES):
+    raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise OSError(f"response larger than {limit} bytes")
+    return raw
+
+
+def gunzip_bounded(raw, limit=MAX_BODY_BYTES):
+    """Inflates exactly one gzip member into at most `limit` bytes. The output
+    ceiling is enforced during inflation, so a small compressed body cannot
+    expand past it in memory first."""
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        body = inflater.decompress(raw, limit + 1)
+    except zlib.error as exc:
+        raise OSError(f"malformed gzip response: {exc}") from None
+    if len(body) > limit:
+        raise OSError(f"decompressed response larger than {limit} bytes")
+    if not inflater.eof:
+        raise OSError("truncated gzip response")
+    if inflater.unused_data:
+        raise OSError("trailing data after gzip member")
+    return body
+
+
 def http_get(url, headers=None, timeout=15):
     """Returns (status, headers, body_text). 304 and 404 are outcomes, not
     errors; anything else that fails raises."""
@@ -699,17 +726,15 @@ def http_get(url, headers=None, timeout=15):
         request.add_header(key, value)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(MAX_BODY_BYTES + 1)
-            if len(raw) > MAX_BODY_BYTES:
-                raise ValueError(f"response larger than {MAX_BODY_BYTES} bytes")
+            raw = read_bounded(response)
             if response.headers.get("Content-Encoding") == "gzip":
-                raw = gzip.decompress(raw)[:MAX_BODY_BYTES]
+                raw = gunzip_bounded(raw)
             return response.status, dict(response.headers), raw.decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""
         if exc.code not in (304,):
             try:
-                body = exc.read().decode("utf-8", "replace")
+                body = read_bounded(exc).decode("utf-8", "replace")
             except Exception:
                 pass
         return exc.code, dict(exc.headers or {}), body
